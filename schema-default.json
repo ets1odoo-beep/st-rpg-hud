@@ -1,0 +1,45 @@
+{
+    "_comment": "Default stat schema for st-rpg-hud v2. Override via <SCHEMA> tag in AI response or via import.",
+
+    "vitals": {
+        "hp": {
+            "name": "HP",
+            "value": 100,
+            "max": 100,
+            "color": "#e05252",
+            "icon": "fa-heart",
+            "group": "vitals"
+        },
+        "mp": {
+            "name": "MP",
+            "value": 80,
+            "max": 80,
+            "color": "#5294c8",
+            "icon": "fa-droplet",
+            "group": "vitals"
+        },
+        "sta": {
+            "name": "Stamina",
+            "value": 100,
+            "max": 100,
+            "color": "#52c87a",
+            "icon": "fa-bolt",
+            "group": "vitals"
+        }
+    },
+
+    "attributes": {
+        "str": { "name": "STR", "value": 10, "group": "core" },
+        "dex": { "name": "DEX", "value": 10, "group": "core" },
+        "con": { "name": "CON", "value": 10, "group": "core" },
+        "int": { "name": "INT", "value": 10, "group": "core" },
+        "wis": { "name": "WIS", "value": 10, "group": "core" },
+        "cha": { "name": "CHA", "value": 10, "group": "core" }
+    },
+
+    "resources": {
+        "gold": { "name": "Gold",  "value": 0, "icon": "fa-coins",  "group": "resources" },
+        "xp":   { "name": "XP",    "value": 0, "icon": "fa-star",   "group": "resources" },
+        "lvl":  { "name": "Level", "value": 1, "icon": "fa-trophy", "group": "resources" }
+    }
+}

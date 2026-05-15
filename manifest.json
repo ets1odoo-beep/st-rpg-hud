@@ -1,0 +1,12 @@
+{
+    "display_name": "RPG HUD",
+    "name": "st-rpg-hud",
+    "loading_order": 200,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "System",
+    "version": "3.0.0",
+    "description": "RPG HUD: tracks stats, skills, inventory, quests, party, and world via AI XML tags."
+}

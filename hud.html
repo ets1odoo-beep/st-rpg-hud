@@ -1,0 +1,238 @@
+<div id="st-rpg-hud" class="rpg-hud-content">
+
+    <!-- Active Goal Strip (always visible, above tabs) -->
+    <div id="rpg-active-goal-strip" class="rpg-goal-strip" style="display:none;">
+        <i class="fa-solid fa-crosshairs rpg-goal-icon"></i>
+        <span id="rpg-active-goal-text"></span>
+    </div>
+
+    <!-- Tab bar -->
+    <div class="rpg-hud-tabs" id="rpg-tab-bar">
+        <div class="rpg-hud-tab active" data-target="panel-overview">
+            <i class="fa-solid fa-heart-pulse"></i> Overview
+        </div>
+        <div class="rpg-hud-tab" data-target="panel-identity">
+            <i class="fa-solid fa-id-card"></i> Identity
+        </div>
+        <div class="rpg-hud-tab" data-target="panel-skills">
+            <i class="fa-solid fa-wand-sparkles"></i> Skills
+        </div>
+        <div class="rpg-hud-tab" data-target="panel-inventory">
+            <i class="fa-solid fa-toolbox"></i> Gear
+        </div>
+        <div class="rpg-hud-tab" data-target="panel-party">
+            <i class="fa-solid fa-users"></i> Party
+        </div>
+        <div class="rpg-hud-tab" data-target="panel-quests">
+            <i class="fa-solid fa-scroll"></i> Quests
+        </div>
+        <div class="rpg-hud-tab" data-target="panel-npcs">
+            <i class="fa-solid fa-handshake"></i> NPCs
+        </div>
+        <div class="rpg-hud-tab" data-target="panel-ledger">
+            <i class="fa-solid fa-scale-balanced"></i> Ledger
+        </div>
+        <div class="rpg-hud-tab" data-target="panel-locations">
+            <i class="fa-solid fa-map-location-dot"></i> World
+        </div>
+        <div class="rpg-hud-tab" data-target="panel-journal">
+            <i class="fa-solid fa-book-open"></i> Journal
+        </div>
+        <div class="rpg-hud-tab" id="rpg-gm-toggle" title="GM Edit Mode">
+            <i class="fa-solid fa-pen-to-square"></i>
+        </div>
+    </div>
+
+    <!-- Panels -->
+    <div class="rpg-hud-panels">
+
+        <!-- Panel 1: Overview -->
+        <div id="panel-overview" class="rpg-hud-panel active">
+            <div id="rpg-combat-banner" class="rpg-combat-banner">
+                <i class="fa-solid fa-swords"></i>
+                <span id="rpg-combat-label">Combat — Turn 1</span>
+                <span id="rpg-ap-display" style="margin-left:auto; font-size:11px;"></span>
+            </div>
+            <div class="rpg-location-bar">
+                <div class="rpg-location-name">
+                    <i class="fa-solid fa-location-dot"></i>
+                    <span id="rpg-location-val">Unknown</span>
+                </div>
+                <span id="rpg-genre-badge" class="rpg-genre-badge" style="display:none"></span>
+                <div class="rpg-location-region" id="rpg-region-val"></div>
+            </div>
+            <div id="rpg-time-bar" style="display:none;" class="rpg-time-bar">
+                <i class="fa-solid fa-clock"></i>
+                <span id="rpg-time-val"></span>
+            </div>
+            <div id="rpg-vitals-container"></div>
+            <div class="rpg-section-heading"><i class="fa-solid fa-dice-d20"></i> Attributes</div>
+            <div id="rpg-attributes-grid" class="rpg-attr-grid"></div>
+            <div class="rpg-section-heading"><i class="fa-solid fa-coins"></i> Resources</div>
+            <div id="rpg-resources-row" class="rpg-resources-row"></div>
+            <div class="rpg-section-heading"><i class="fa-solid fa-flask-vial"></i> Status</div>
+            <div id="rpg-statuses-row" class="rpg-pill-row">
+                <span class="rpg-empty">No active effects</span>
+            </div>
+        </div>
+
+        <!-- Panel 2: Identity (VIR + charInner + charExternal + mindset + charDev + VAD) -->
+        <div id="panel-identity" class="rpg-hud-panel">
+            <!-- Scene summary strip (shown when multiple chars) -->
+            <div id="rpg-scene-summary" class="rpg-scene-summary" style="display:none;"></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-brain"></i> Inner Stats</div>
+            <div id="rpg-charinner-bars"><span class="rpg-empty">No inner stats tracked yet.</span></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-user"></i> Appearance</div>
+            <div id="rpg-charexternal-fields"><span class="rpg-empty">No appearance data yet.</span></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-masks-theater"></i> Character Personas</div>
+            <div id="rpg-personas-list"><span class="rpg-empty">No persona cards yet. AI will populate via personas:{} data.</span></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-thought-bubble"></i> Mindset</div>
+            <div id="rpg-mindset"><span class="rpg-empty">No mindset data yet.</span></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-eye"></i> VAD (Emotional State)</div>
+            <div id="rpg-vad-panel"><span class="rpg-empty">No VAD data yet.</span></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-fingerprint"></i> VIR Registry</div>
+            <div id="rpg-vir-cards"><span class="rpg-empty">No VIR data yet. AI will populate this.</span></div>
+
+            <div class="rpg-chardev-section" style="display:none;">
+                <div class="rpg-section-heading"><i class="fa-solid fa-chart-line"></i> Dev Stats</div>
+                <div id="rpg-chardev-bars"><span class="rpg-empty">No dev stats yet.</span></div>
+            </div>
+        </div>
+
+        <!-- Panel 3: Skills -->
+        <div id="panel-skills" class="rpg-hud-panel">
+            <div id="rpg-skills-list" class="rpg-pill-row">
+                <span class="rpg-empty">No skills learned yet.</span>
+            </div>
+        </div>
+
+        <!-- Panel 4: Inventory & Equipment -->
+        <div id="panel-inventory" class="rpg-hud-panel">
+            <div class="rpg-section-heading"><i class="fa-solid fa-person-dress"></i> Outfit</div>
+            <div id="rpg-outfit-list">
+                <span class="rpg-empty">No outfits tracked.</span>
+            </div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-shirt"></i> Equipped</div>
+            <div id="rpg-equip-grid" class="rpg-equip-grid"></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-box-open"></i> Backpack</div>
+            <div id="rpg-backpack-grid" class="rpg-backpack-grid">
+                <span class="rpg-empty">Backpack is empty.</span>
+            </div>
+        </div>
+
+        <!-- Panel 5: Party -->
+        <div id="panel-party" class="rpg-hud-panel">
+            <div id="rpg-party-list">
+                <span class="rpg-empty">No party members.</span>
+            </div>
+        </div>
+
+        <!-- Panel 6: Quests -->
+        <div id="panel-quests" class="rpg-hud-panel">
+            <div class="rpg-section-heading"><i class="fa-solid fa-circle-dot" style="color:#52c87a"></i> Active</div>
+            <div id="rpg-active-quests"></div>
+            <div class="rpg-section-heading"><i class="fa-solid fa-circle-check" style="color:#888"></i> Completed / Failed</div>
+            <div id="rpg-done-quests"></div>
+        </div>
+
+        <!-- Panel 7: NPCs -->
+        <div id="panel-npcs" class="rpg-hud-panel">
+            <div id="rpg-npc-list">
+                <span class="rpg-empty">No known NPCs.</span>
+            </div>
+            <div id="rpg-npc-relations-section" style="display:none;">
+                <div class="rpg-section-heading"><i class="fa-solid fa-diagram-project"></i> Relations</div>
+                <div id="rpg-npc-relations"></div>
+            </div>
+        </div>
+
+        <!-- Panel 8: Ledger (relationships, secrets, threats, scene_state) -->
+        <div id="panel-ledger" class="rpg-hud-panel">
+            <div class="rpg-section-heading"><i class="fa-solid fa-scale-balanced"></i> Relationships</div>
+            <div id="rpg-relationships-list"><span class="rpg-empty">No relationships tracked yet.</span></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-lock"></i> Secrets</div>
+            <div id="rpg-secrets-list"><span class="rpg-empty">No secrets tracked.</span></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-triangle-exclamation"></i> Open Threats</div>
+            <div id="rpg-threats-list"><span class="rpg-empty">No active threats.</span></div>
+
+            <!-- Phase 6: scene_state (lighting + per-character mutable state) -->
+            <div class="rpg-section-heading"><i class="fa-solid fa-lightbulb"></i> Scene State (this turn)</div>
+            <div id="rpg-scene-state-wide"><span class="rpg-empty">No scene-wide state.</span></div>
+            <div id="rpg-scene-state-perchar"></div>
+        </div>
+
+        <!-- Panel 9: World / Locations -->
+        <div id="panel-locations" class="rpg-hud-panel">
+            <div class="rpg-location-bar" style="margin-bottom:12px;">
+                <div class="rpg-location-name">
+                    <i class="fa-solid fa-compass"></i>
+                    <span id="rpg-world-location">Unknown</span>
+                </div>
+                <div class="rpg-location-region" id="rpg-world-region">Unknown Region</div>
+            </div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-user-group"></i> People Here</div>
+            <div id="rpg-people-here" class="rpg-pill-row">
+                <span class="rpg-empty">Nobody notable here.</span>
+            </div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-map-pin"></i> Landmarks</div>
+            <ul id="rpg-landmarks-list" class="rpg-landmark-list">
+                <li class="rpg-empty">No landmarks discovered.</li>
+            </ul>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-cube"></i> Scene Objects</div>
+            <div id="rpg-scene-objects-list">
+                <span class="rpg-empty">No persistent objects tracked.</span>
+            </div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-shield-halved"></i> Factions</div>
+            <div id="rpg-factions-list">
+                <span class="rpg-empty">No factions encountered.</span>
+            </div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-route"></i> Travel Log</div>
+            <div id="rpg-travel-log" class="rpg-travel-log">
+                <span class="rpg-empty">No travel history yet.</span>
+            </div>
+        </div>
+
+        <!-- Panel 10: Journal -->
+        <div id="panel-journal" class="rpg-hud-panel">
+            <div class="rpg-section-heading"><i class="fa-solid fa-thumbtack"></i> Established Facts</div>
+            <div id="rpg-facts-list"><span class="rpg-empty">No pinned facts yet.</span></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-star"></i> Key Moments</div>
+            <div id="rpg-key-moments-list"><span class="rpg-empty">No key moments crystallized yet.</span></div>
+
+            <div id="rpg-flags-list" class="rpg-flags-row"></div>
+            <div id="rpg-journal-list"></div>
+
+            <div id="rpg-contradiction-section" style="display:none;">
+                <div class="rpg-section-heading rpg-section-heading-warn">
+                    <i class="fa-solid fa-triangle-exclamation"></i> Drift &amp; Contradiction Log
+                    <button id="rpg-clear-contradictions" class="rpg-mini-btn" title="Clear all">Clear</button>
+                </div>
+                <div id="rpg-contradiction-list"></div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Topics footer (hidden when no topics) -->
+    <div id="rpg-topics-footer" class="rpg-topics-footer" style="display:none;"></div>
+
+    <!-- Macros bar (bottom) -->
+    <div id="rpg-macros-bar"></div>
+
+</div>
