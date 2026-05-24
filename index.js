@@ -52,7 +52,38 @@ function getCFG() {
     if (cfg.opts.keepDeceasedInRoster === undefined) cfg.opts.keepDeceasedInRoster = true;
     if (cfg.opts.aggressiveJsonRepair === undefined) cfg.opts.aggressiveJsonRepair = true;
 
+    // ── v4 token-saver toggles (see rpg-hud-v4-plan.md) ────────────────────
+    if (cfg.opts.deltaOnly === undefined)          cfg.opts.deltaOnly = true;        // A.1
+    if (cfg.opts.tieredInjection === undefined)    cfg.opts.tieredInjection = true;  // A.2
+    if (cfg.opts.adaptiveReminder === undefined)   cfg.opts.adaptiveReminder = true; // A.3
+    if (cfg.opts.offSceneToLorebook === undefined) cfg.opts.offSceneToLorebook = true; // A.5
+    if (cfg.opts.compactPersona === undefined)     cfg.opts.compactPersona = true;   // B.5
+    if (cfg.opts.heartbeatInterval === undefined)  cfg.opts.heartbeatInterval = 10;  // B.3
+    if (cfg.opts.virMode === undefined)            cfg.opts.virMode = 'self';        // B.1: 'self'|'bridge'|'off'
+
     return cfg;
+}
+
+// ── VIR Extension detection (B.1) ────────────────────────────────────────────
+// Checks for ff4-vir-lorebook-sync presence. Bridge mode only activates when
+// the extension is actually loaded; falls back to self-contained silently.
+function virExtensionActive() {
+    try {
+        if (typeof window !== 'undefined' && window.FF4_VIR_API) return true;
+        if (extension_settings && extension_settings['ff4-vir-lorebook-sync']) {
+            const v = extension_settings['ff4-vir-lorebook-sync'];
+            // ff4-vir stores per-chat enable; we just check the settings node exists
+            return !!v && (v.enabled !== false);
+        }
+    } catch(e) { /* ignore */ }
+    return false;
+}
+
+// Resolved VIR mode: opts setting + actual availability
+function resolvedVirMode() {
+    const mode = getCFG().opts.virMode || 'self';
+    if (mode === 'bridge' && !virExtensionActive()) return 'self'; // fallback
+    return mode;
 }
 
 // ── State helpers ─────────────────────────────────────────────
@@ -102,6 +133,19 @@ function emptyState() {
         _contradictions: [],// [{turn, type, message}] — drift/violation log
         _parseMisses: 0,    // count of turns with no rpg block found
         _summaries: [],     // [{turns:'1-15', text:'...'}] — compressed old-message summaries
+        // ── v4 token-saver tracking ──
+        _lastFullEchoTurn: 0,  // turn of last full-echo rpg block (B.3 heartbeat)
+        _seenPersonas: {},     // {name:true} — personas already shown in full this chat (B.5)
+        _lorebookOffscene: {}, // {npcName: {worldName, uid}} — A.5 lorebook bookkeeping
+        // ── v4.1 immersion tracking ──
+        _npcLastSeenTurn: {},  // {name: turn} — when each NPC was last in scene (for return callback)
+        _goalStartedTurn: 0,   // turn when current active_goal was set (stagnation nudge)
+        _lastLocation: '',     // detect location-change for scene transition cue
+        _lastTimeSnapshot: null, // {day,hour} from prior turn (time-skip detection)
+        _milestonesHit: {},    // {`${name}|${field}|${tier}`: turn} — relationship milestones already announced
+        _lastSummaryTurn: 0,   // last turn we ran summarisation (A.6)
+        _lastSummaryLocation: '', // location at last summary (location-change trigger)
+        _ruleOverlay: '',      // per-chat extra rules (C.6)
     };
 }
 
@@ -175,6 +219,22 @@ function migrate(s) {
         s._v = 5;
         getContext().saveSettingsDebounced();
     }
+    // ── v6 → v7 (v4-plan token saver internal fields) ──────────────────────
+    if (s._v >= 6 && (s._lastFullEchoTurn === undefined || s._seenPersonas === undefined || s._lorebookOffscene === undefined)) {
+        if (s._lastFullEchoTurn === undefined) s._lastFullEchoTurn = 0;
+        if (s._seenPersonas === undefined)     s._seenPersonas = {};
+        if (s._lorebookOffscene === undefined) s._lorebookOffscene = {};
+        getContext().saveSettingsDebounced();
+    }
+    // ── v4.1 immersion tracking fields ─────────────────────────────────────
+    if (s._npcLastSeenTurn === undefined)    s._npcLastSeenTurn = {};
+    if (s._goalStartedTurn === undefined)    s._goalStartedTurn = 0;
+    if (s._lastLocation === undefined)       s._lastLocation = '';
+    if (s._lastTimeSnapshot === undefined)   s._lastTimeSnapshot = null;
+    if (s._milestonesHit === undefined)      s._milestonesHit = {};
+    if (s._lastSummaryTurn === undefined)    s._lastSummaryTurn = 0;
+    if (s._lastSummaryLocation === undefined) s._lastSummaryLocation = '';
+    if (s._ruleOverlay === undefined)        s._ruleOverlay = '';
     // ── v5 → v6 (preset-aligned roster persistence + scene_state) ──────────
     if (s._v < 6) {
         // scene_state ledger — split per-character (mutable) from sceneWide (lighting)
@@ -1249,7 +1309,12 @@ function applyJsonBlock(data, s) {
 
     // ── v5: active_goal — current scene objective ──
     if (typeof data.active_goal === 'string' && data.active_goal.trim()) {
-        s.active_goal = data.active_goal.trim();
+        const newGoal = data.active_goal.trim();
+        // v4.1: track when goal changed for stagnation nudge
+        if (newGoal !== s.active_goal) {
+            s._goalStartedTurn = s._turnCount || 0;
+        }
+        s.active_goal = newGoal;
         ch = true;
     }
 
@@ -1297,12 +1362,26 @@ function applyJsonBlock(data, s) {
     if (Array.isArray(data.npcs)) {
         if (!s.map) s.map = { currentLocation: 'Unknown', region: 'Unknown', landmarks: [], travelLog: [], peopleHere: [] };
         if (!s.map.peopleHere) s.map.peopleHere = [];
+        if (!s._npcLastSeenTurn) s._npcLastSeenTurn = {};
+        const tNow = s._turnCount || 0;
         for (const n of data.npcs) {
             if (!n.name) continue;
-            if (n.people_here === true && !s.map.peopleHere.includes(n.name)) {
+            const wasHere = s.map.peopleHere.includes(n.name);
+            if (n.people_here === true && !wasHere) {
                 s.map.peopleHere.push(n.name);
-            } else if (n.people_here === false) {
+                // v4.1: record last-seen turn for return callbacks; only set if
+                // they were truly absent (not first-ever entry)
+                if (s._npcLastSeenTurn[n.name] === undefined) {
+                    // first ever — mark zero so return callback won't fire
+                    s._npcLastSeenTurn[n.name] = tNow;
+                }
+            } else if (n.people_here === false && wasHere) {
                 s.map.peopleHere = s.map.peopleHere.filter(x => x !== n.name);
+                // record the turn they left so a future return knows the gap
+                s._npcLastSeenTurn[n.name] = tNow;
+            } else if (n.people_here === true && wasHere) {
+                // refresh last-seen turn while present (no callback needed yet)
+                s._npcLastSeenTurn[n.name] = tNow;
             }
             // Also store current_goal on the NPC object
             if (n.current_goal !== undefined) {
@@ -1375,6 +1454,22 @@ function applyJsonBlock(data, s) {
     // ── v5: Increment turn counter ──
     s._turnCount = (s._turnCount || 0) + 1;
 
+    // ── B.3: Detect full-echo and reset heartbeat ──
+    // A "full echo" is any rpg block carrying ≥4 distinct top-level state
+    // categories — meaning the AI re-emitted the bulk of the state rather
+    // than a small delta. Used to confirm the heartbeat checkpoint landed.
+    if (data && typeof data === 'object') {
+        const echoKeys = ['vitals','location','time','npcs','quests','inventory','vir','facts','charInner','active_goal','statuses','skills'];
+        const hits = echoKeys.filter(k => data[k] !== undefined).length;
+        if (hits >= 4) {
+            s._lastFullEchoTurn = s._turnCount;
+            // Clear parse-miss streak — full echo confirms AI is healthy
+            if ((s._parseMisses || 0) > 0) {
+                s._parseMisses = 0;
+            }
+        }
+    }
+
     // ── v5: Basic VIR contradiction scan (prose-level) ──
     // Called from processMessage() with full text, not just JSON — skipped here
     // (see runVirScan below)
@@ -1415,6 +1510,144 @@ function runVirScan(text, s) {
     }
 }
 
+// ── v4.1: B.2 STATS UPDATE bridge to ff4-vir stats tracker ────────────────────
+// Parses the visible "─── STATS UPDATE ───" markdown block that the ff4-vir
+// extension's VIR_CONTRACT instructs the AI to emit. Each bullet is
+// "• StatName old → new — reason". Maps known stat names to RPG HUD state.
+// Stores parsed deltas in s._statsUpdate (for the World Sim tab) and applies
+// to charInner/vitals/npcs[].trust where field names match.
+//
+// Rule when both systems run: rpg block wins. This bridge only fills gaps —
+// it never overwrites a value already set by the rpg block this turn.
+
+function applyStatsUpdateBlock(text, s) {
+    if (!text || typeof text !== 'string') return;
+    // Match the section between ─── STATS UPDATE ─── and the next ─── line
+    // OR the next ```vir / ```rpg fence, OR end of text.
+    const headerRx = /─{3,}\s*STATS UPDATE\s*─{3,}/i;
+    const m = text.match(headerRx);
+    if (!m) return;
+    const start = m.index + m[0].length;
+    let end = text.length;
+    const tail = text.slice(start);
+    const endRx = /(─{3,}|```(?:vir|rpg))/i;
+    const em = tail.match(endRx);
+    if (em) end = start + em.index;
+    const body = text.slice(start, end);
+
+    // Bullet: "• StatName old → new — reason"  OR  "* Stat old -> new - reason"
+    const bulletRx = /^\s*(?:[•\*\-]|[•])\s*([A-Za-z][A-Za-z0-9_()/ -]*?)\s*(?:=|:)?\s*([-]?[\d.]+|low|mid|high)?\s*(?:→|->|to)\s*([-]?[\d.]+|low|mid|high)\s*(?:[—\-]\s*(.+))?$/gm;
+    // Simpler bullet form: "• StatName: X → Y — reason"
+    const lineRx = /^\s*[•\*\-]\s+(.+)$/gm;
+    const turn = s._turnCount || 0;
+    const events = [];
+    let charContext = null; // current **CharacterName** header
+    for (const raw of body.split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line) continue;
+        // Character header: **Name**
+        const headM = line.match(/^\*\*(.+?)\*\*$/);
+        if (headM) { charContext = headM[1].trim(); continue; }
+        // Italic "no change" marker
+        if (/^\*no stats changed/i.test(line)) continue;
+        // Bullet
+        const bm = line.match(/^[•\*\-]\s*(.+)$/);
+        if (!bm) continue;
+        const content = bm[1];
+        // Parse "Stat old → new — reason"
+        const deltaM = content.match(/^([A-Za-z][\w()/ -]*?)\s+([-]?\d+(?:\.\d+)?)\s*(?:→|->)\s*([-]?\d+(?:\.\d+)?)\s*(?:[—\-]\s*(.+))?$/);
+        if (deltaM) {
+            const stat = deltaM[1].trim();
+            const oldV = parseFloat(deltaM[2]);
+            const newV = parseFloat(deltaM[3]);
+            const reason = (deltaM[4] || '').trim();
+            events.push({ character: charContext, stat, oldV, newV, reason, turn });
+        }
+    }
+    if (!events.length) return;
+
+    // Store for the World Sim tab
+    if (!s._statsUpdate) s._statsUpdate = [];
+    s._statsUpdate.push({ turn, events });
+    if (s._statsUpdate.length > 50) s._statsUpdate = s._statsUpdate.slice(-50);
+
+    // Apply gap-filling: only update HUD state when the rpg block didn't
+    // already touch this field this turn. We use _stateChangelog as the
+    // signal of "rpg block touched X" — anything that wasn't logged is
+    // free to fill from the STATS UPDATE block.
+    const rpgTouched = new Set((s._stateChangelog || []).filter(c => c.turn === turn).map(c => c.field));
+
+    for (const ev of events) {
+        const stat = ev.stat.toLowerCase();
+        const tgt = ev.character;
+
+        // Map common stat names → HUD paths
+        if (tgt && /^trust\(.+\)$/.test(stat) || stat === 'trust') {
+            // Per-NPC trust
+            const npc = (s.npcs || []).find(n => n.name === tgt);
+            if (npc && !rpgTouched.has(`npc.${tgt}.trust`)) {
+                npc.trust = ev.newV;
+            }
+        } else if (tgt && (stat === 'affection' || stat === 'fear' || stat === 'respect' || stat === 'hostility' || stat === 'gratitude')) {
+            const npc = (s.npcs || []).find(n => n.name === tgt);
+            if (npc && !rpgTouched.has(`npc.${tgt}.${stat}`)) {
+                npc[stat] = ev.newV;
+            }
+        } else if (stat === 'health' || stat === 'hp') {
+            if (s.vitals?.hp && !rpgTouched.has('vitals.hp')) {
+                s.vitals.hp.value = Math.max(0, Math.min(s.vitals.hp.max ?? ev.newV, ev.newV));
+            } else if (!rpgTouched.has(`charInner.health`)) {
+                if (!s.charInner) s.charInner = {};
+                s.charInner.health = Math.max(0, Math.min(100, ev.newV));
+            }
+        } else if (['moral','confidence','shame','promiscuity','arousal','dependence','love'].includes(stat)) {
+            if (!rpgTouched.has(`charInner.${stat}`)) {
+                if (!s.charInner) s.charInner = {};
+                s.charInner[stat] = Math.max(0, Math.min(100, ev.newV));
+            }
+        } else if (stat === 'stamina' || stat === 'sta') {
+            if (s.vitals?.sta && !rpgTouched.has('vitals.sta')) {
+                s.vitals.sta.value = Math.max(0, Math.min(s.vitals.sta.max ?? ev.newV, ev.newV));
+            }
+        }
+        // Unknown stats are stored in _statsUpdate but not applied — visible
+        // in World Sim tab for GM review.
+    }
+}
+
+// ── v4.1: Persona drift detector ──────────────────────────────────────────────
+// Scans the AI reply prose for actions/dialogue that violate any in-scene
+// NPC's persona.forbidden field. Pattern is intentionally conservative —
+// only flags when the forbidden phrase appears literally in prose attributed
+// to that character (e.g. "Mika cried" when forbidden says "Never cries").
+function runPersonaDriftScan(text, s) {
+    if (!text || !s.personas) return;
+    const peopleHere = s.map?.peopleHere || [];
+    const turn = s._turnCount || 0;
+    if (!s._contradictions) s._contradictions = [];
+    for (const name of peopleHere) {
+        const persona = s.personas[name];
+        if (!persona?.forbidden) continue;
+        // Tokenize forbidden into key phrases
+        const phrases = String(persona.forbidden).split(/[.;]+/).map(p => p.trim()).filter(Boolean);
+        for (const phrase of phrases) {
+            // "Never cries in front of others" → check for "cries" near the name
+            const verbM = phrase.match(/\b(?:Never|Won't|Doesn't|Does not|Will not)\s+(\w+)/i);
+            if (!verbM) continue;
+            const verb = verbM[1].toLowerCase();
+            // Conjugate roots: cry → cries/cried/crying
+            const verbStems = new Set([verb, verb + 's', verb + 'ed', verb + 'ing', verb.replace(/y$/, 'ies'), verb.replace(/y$/, 'ied')]);
+            // Look for `name` and a stem within 60 chars
+            const nameRx = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\b[\\s\\S]{0,60}\\b(${[...verbStems].join('|')})\\b`, 'i');
+            if (nameRx.test(text)) {
+                const msg = `Persona slip: ${name} did "${verb}" — forbidden by their persona ("${phrase}")`;
+                const already = s._contradictions.some(c => c.turn === turn && c.message === msg);
+                if (!already) s._contradictions.push({ turn, type: 'persona_drift', message: msg });
+            }
+        }
+    }
+}
+
 
 // ── C.1: Rolling Chat Summarizer ─────────────────────────────
 const SUMMARIZE_INTERVAL = 15;
@@ -1423,7 +1656,24 @@ function maybeSummarize(s) {
     const turn = s._turnCount || 0;
     if (!s._summaries) s._summaries = [];
     const lastEndTurn = s._summaries.length ? s._summaries[s._summaries.length - 1].endTurn : 0;
-    if (turn - lastEndTurn < SUMMARIZE_INTERVAL) return;
+    const turnsSince = turn - lastEndTurn;
+
+    // ── v4.1 A.6: Smart triggers — summarise sooner if scene completed ──
+    // Hard floor: don't summarise more than once per 4 turns to avoid spam.
+    if (turnsSince < 4) return;
+    const curLoc = s.map?.currentLocation || s.location || '';
+    const locChanged = curLoc && s._lastSummaryLocation && curLoc !== s._lastSummaryLocation;
+    const recentQuestComplete = (s._stateChangelog || []).some(e =>
+        e.turn > lastEndTurn && e.field?.startsWith('quest.') && /complete|fail/i.test(String(e.to||''))
+    );
+    const combatJustEnded = !s.combat?.active && (s._stateChangelog || []).some(e =>
+        e.turn > lastEndTurn && e.turn >= turn - 1 && e.field === 'combat.active' && e.from === true
+    );
+    const smartTrigger = locChanged || recentQuestComplete || combatJustEnded;
+    // Fall back to the normal interval if no scene-end signal
+    if (!smartTrigger && turnsSince < SUMMARIZE_INTERVAL) return;
+    s._lastSummaryLocation = curLoc;
+    s._lastSummaryTurn = turn;
 
     const startTurn = lastEndTurn;
     const endTurn = turn;
@@ -1552,6 +1802,12 @@ function processMessage(text) {
     // ── v5: VIR contradiction scan on raw prose ──
     try { runVirScan(text, s); } catch(e) { console.warn('[st-rpg-hud] VIR scan error', e); }
 
+    // ── v4.1: B.2 STATS UPDATE bridge ─────────────────────────────────────
+    try { applyStatsUpdateBlock(text, getState()); } catch(e) { console.warn('[st-rpg-hud] STATS UPDATE parse error', e); }
+
+    // ── v4.1: Persona drift detection ─────────────────────────────────────
+    try { runPersonaDriftScan(text, getState()); } catch(e) { console.warn('[st-rpg-hud] persona drift scan error', e); }
+
     // ── v5: Format-miss detection ──
     // If message is substantive (>80 words) but produced no parseable rpg block, log it
     if (parsed === null) {
@@ -1572,6 +1828,9 @@ function processMessage(text) {
     // ── C.1: Maybe generate a rolling summary ──
     try { maybeSummarize(s); } catch(e) { console.warn('[st-rpg-hud] summarize error', e); }
 
+    // ── A.5: Sync off-scene NPCs to keyword-gated lorebook (async, fire-and-forget) ──
+    try { syncOffsceneNpcs(s); } catch(e) { console.warn('[st-rpg-hud] A.5: sync error', e); }
+
     if (ch) { s.initialized = true; saveState(); }
     return !!ch;
 }
@@ -1586,7 +1845,45 @@ function processMessage(text) {
 // secrets/open_threats/topics/world_flags/scene_objects/personas/keyMoments/
 // active_goal) PLUS the 10 validation rules (VIR LOCK, FACT LOCK, PERSONA,
 // DELTA LIMITS, RANGE, CONTINUITY, OUTFIT, rel_event, active_goal, scene_objects).
-const FORMAT_REMINDER = `
+// ── A.3 + A.1: Three FORMAT_REMINDER sizes for adaptive injection ────────────
+// MINIMAL (~30 tokens): steady-state default — delta-only output, no schema
+// STANDARD (~150 tokens): condensed field reference — used after parse miss
+// FULL (~600 tokens): complete schema — first turn, init, or repeated misses
+//
+// pickFormatReminder(s) chooses the right size each turn based on:
+//   - state.initialized          (first-turn always gets FULL)
+//   - state._parseMisses         (escalate when AI keeps skipping the block)
+//   - state._lastFullEchoTurn    (every N turns request a full echo)
+//   - cfg.opts.adaptiveReminder  (master toggle)
+// When adaptiveReminder is off, behaviour matches v3 (FULL every turn).
+
+const FORMAT_REMINDER_MINIMAL = `[RPG STATE TRACKER]
+End every reply with a \`\`\`rpg\`\`\` JSON block (no comments, no trailing commas).
+DELTA-ONLY MODE: emit ONLY fields that CHANGED this turn. The HUD merges deltas into stored state. Unchanged fields are kept as-is.
+ALWAYS include: vitals, location (if changed), active_goal. Use rel_event when trust/affection/fear change by >3.
+[END]`.trim();
+
+const FORMAT_REMINDER_STANDARD = `[RPG STATE TRACKER — condensed]
+End every reply with a \`\`\`rpg\`\`\` JSON block (valid JSON, NO comments, NO trailing commas).
+DELTA-ONLY MODE: emit ONLY fields that CHANGED this turn — the HUD merges deltas into persisted state.
+
+Schema (only the fields you are updating):
+  vitals{hp:[v,max],mp:[v,max]} | resources{gold,exp} | location | time{day,hour,period}
+  combat{active,turn,ap,ap_max,enemy} | statuses[{id,name,type,turns,action}]
+  npcs[{name,role,disposition,trust,affection,fear,outfit,note,current_goal,people_here}]
+  quests[{id,action:add|step|complete|fail,title,desc,step}] | inventory[{name,action,qty,slot}]
+  vir{<name>:{...nested-object form}} | vir_changes{<name>:{path:value}}
+  facts[{id,text,priority}|{id,action:"remove"}] | scene_objects[{id,name,desc,location,action}]
+  charInner{health,moral,confidence,shame,promiscuity,arousal,dependence,love}
+  mindset{mood,thoughts} | personas{<name>:{voice,core_belief,forbidden,goals,quirks}}
+  active_goal:"string"  (REQUIRED every turn)
+  rel_event:"string"   (REQUIRED when trust/affection/fear change by >3)
+  key_moment:"string"  (only for pivotal beats, max 1/turn)
+
+Limits: trust ±15, affection ±12, love ±10, arousal ±30, fear ±15. charInner 0–100. vitals 0..max.
+[END]`.trim();
+
+const FORMAT_REMINDER_FULL = `
 [SYSTEM: RPG STATE TRACKER — unified schema, MANDATORY]
 EVERY response MUST end with a \`\`\`rpg code block (valid JSON, NO comments, NO trailing commas).
 
@@ -1669,18 +1966,68 @@ DO NOT include trailing commas after the last array/object element.
 DO escape literal newlines inside strings (use \\n).
 [END SYSTEM]`.trim();
 
+// ── A.3: Choose the right FORMAT_REMINDER size for this turn ─────────────────
+function pickFormatReminder(s) {
+    const cfg = getCFG();
+    if (!cfg.opts.adaptiveReminder) return FORMAT_REMINDER_FULL;       // legacy
+
+    const tc      = s._turnCount || 0;
+    const misses  = s._parseMisses || 0;
+    const initd   = !!s.initialized;
+
+    // First turn of chat OR not yet initialized → full schema
+    if (!initd || tc === 0) return FORMAT_REMINDER_FULL;
+    // 3+ misses in a row → full reminder to recover
+    if (misses >= 3) return FORMAT_REMINDER_FULL;
+    // 1–2 misses → condensed schema
+    if (misses >= 1) return FORMAT_REMINDER_STANDARD;
+    // Steady state → minimal
+    return FORMAT_REMINDER_MINIMAL;
+}
+
+// ── B.3: Heartbeat / full-echo gate ──────────────────────────────────────────
+// Returns true when the AI should be asked to emit the full state echo this
+// turn (not a delta). Triggers every `heartbeatInterval` turns, after any
+// parse miss, or when state was reset/loaded.
+function shouldRequestFullEcho(s) {
+    const cfg = getCFG();
+    if (!cfg.opts.deltaOnly) return true; // delta-only off → always full
+    const tc       = s._turnCount || 0;
+    const lastEcho = s._lastFullEchoTurn || 0;
+    const misses   = s._parseMisses || 0;
+    const interval = Math.max(2, cfg.opts.heartbeatInterval || 10);
+    if (!s.initialized) return true;
+    if (misses > 0) return true;
+    if (tc - lastEcho >= interval) return true;
+    return false;
+}
+
 function buildContext(s) {
     const cfg = getCFG();
     const budget = cfg.opts?.budget || "standard";
 
-    // Single unified reminder — covers V6 preset-aligned schema (vir/vir_changes/
-    // scene_state/outfit_change with full nested objects + roster persistence)
-    // PLUS all the v5 fields the HUD consumes (facts, charInner, mindset,
-    // keyMoments, scene_objects, personas, etc) PLUS validation rules. One
-    // source of truth for the AI; no toggles, no modes.
-    const lines = [FORMAT_REMINDER, "", "=== CURRENT RPG STATE (reproduce these values in your ```rpg block) ==="];
+    // A.3: Adaptive reminder + A.1: delta-only / full-echo signalling
+    const reminder = pickFormatReminder(s);
+    const fullEchoRequested = shouldRequestFullEcho(s);
+
+    const lines = [reminder, ""];
+    if (cfg.opts.deltaOnly && !fullEchoRequested) {
+        lines.push("=== STATE SNAPSHOT (delta-only mode — emit ONLY changed fields in your ```rpg block) ===");
+    } else {
+        lines.push("=== CURRENT RPG STATE (FULL ECHO requested this turn — reproduce ALL fields in your ```rpg block) ===");
+        if (cfg.opts.deltaOnly && fullEchoRequested) {
+            lines.push("FULL_ECHO_REQUESTED: true   // heartbeat checkpoint — emit complete state once, then return to delta-only");
+        }
+    }
     if (!s.initialized) {
         lines.push("STATUS: Not yet initialized. On your FIRST response, establish the complete starting state.");
+    }
+
+    // ── B.4: Active goal as SCENE ANCHOR — top of TIER 1, before vitals ──
+    // Recency-anchor the current scene objective so it's the freshest piece of
+    // state context the model sees when planning the next reply.
+    if (s.active_goal) {
+        lines.push(`[ACTIVE GOAL → ${s.active_goal}]`);
     }
 
     // Always include vitals (AI must echo these every response for consistency)
@@ -1688,6 +2035,13 @@ function buildContext(s) {
     if (vArr.length) lines.push("Vitals: "+vArr.join(" | "));
 
     if (s.combat?.active) lines.push(`⚔ COMBAT: Turn ${s.combat.turn}, AP ${s.combat.ap}/${s.combat.ap_max}${s.combat.enemy?", vs "+s.combat.enemy:""}`);
+
+    // A.2: Determine if we should suppress heavy sections this turn.
+    // When tiered + delta-only + not full-echo: emit only TIER 1 + scene TIER 2.
+    // Heavy sections (relationship history, charDev/charInner detail, story
+    // summaries, VAD, key moments overflow) skipped — they're rebuilt from
+    // persisted state, the AI doesn't need to re-see them every turn.
+    const tieredLight = cfg.opts.tieredInjection && cfg.opts.deltaOnly && !fullEchoRequested;
 
     // Location — always include
     const loc = s.map?.currentLocation||s.location||"Unknown";
@@ -1738,7 +2092,10 @@ function buildContext(s) {
                 ? ` | REVEALED AGENDA: ${n.hidden_agenda}` : "";
             lines.push(`  - ${n.name} (${n.role||"?"}, ${n.disposition||"neutral"})${relParts.length?" ["+relParts.join(", ")+"]":""}${outfitPart}${goalPart}${agendaPart}${lastSeenPart}: ${n.note||""}`);
         }
-        if (offSceneNpcs.length && budget !== "compact") {
+        // A.5: When offSceneToLorebook is enabled, off-scene NPCs are written
+        // to keyword-gated lorebook entries instead of injected here. Skip the
+        // inline list entirely. When the toggle is off, fall back to v3 behaviour.
+        if (offSceneNpcs.length && budget !== "compact" && !cfg.opts.offSceneToLorebook) {
             lines.push("  Off-scene: "+offSceneNpcs.map(n=>`${n.name}(${n.disposition||"neutral"}, trust=${n.trust||0})`).join(", "));
         }
     }
@@ -1806,34 +2163,55 @@ function buildContext(s) {
     // ── v4: open threats ──
     if (s.open_threats?.length) lines.push("Open Threats: "+s.open_threats.map(t=>`[${t.source||"?"}] ${t.nature||""}`).join(" | "));
 
-    // ── v4: VIR Registry ──
-    if (s.vir && Object.keys(s.vir).length) {
-        const virBlock = Object.entries(s.vir).map(([name, traits]) => {
-            const fields = Object.entries(traits).map(([k, v]) => `    ${k}: ${v}`).join('\n');
-            return `  [${name}]\n${fields}`;
-        }).join('\n');
-        lines.push(
-            `\n[ACTIVE VIR REGISTRY — Authoritative visual traits. LOCKED against drift.` +
-            ` Copy EXACTLY into every <pic prompt>. Only update via narrated story event + vir delta.]\n${virBlock}`
-        );
+    // ── v4: VIR Registry — B.1: gated by virMode ──
+    // 'self'   → inject the full registry (legacy, default)
+    // 'bridge' → skip injection, ff4-vir-lorebook-sync handles VIR entries
+    // 'off'    → skip injection entirely (user has external system or none)
+    // In tieredLight, even self-contained mode injects only scene characters'
+    // VIR data — off-scene VIR lives in the lorebook (A.5).
+    const virMode = resolvedVirMode();
+    if (virMode === 'self' && s.vir && Object.keys(s.vir).length) {
+        const peopleHere = s.map?.peopleHere || [];
+        const virEntries = Object.entries(s.vir).filter(([name, traits]) => {
+            if (!traits || traits.active === false) return false;
+            // Light mode: only inject characters in current scene
+            if (tieredLight && peopleHere.length && !peopleHere.includes(name)) return false;
+            return true;
+        });
+        if (virEntries.length) {
+            const virBlock = virEntries.map(([name, traits]) => {
+                const fields = Object.entries(traits)
+                    .filter(([k]) => k !== 'active' && k !== 'status' && !k.startsWith('_'))
+                    .map(([k, v]) => `    ${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`)
+                    .join('\n');
+                return `  [${name}]\n${fields}`;
+            }).join('\n');
+            lines.push(
+                `\n[ACTIVE VIR REGISTRY — Authoritative visual traits. LOCKED against drift.` +
+                ` Copy EXACTLY into every <pic prompt>. Only update via narrated story event + vir delta.]\n${virBlock}`
+            );
+        }
     }
 
     // ══ v5 ACCURACY INJECTIONS ══════════════════════════════════
 
-    // ── v5: Adaptive urgency header (scales with turn depth) ──
+    // ── v5: Adaptive urgency header — A.2: only in non-light mode ──
+    // The minimal/standard FORMAT_REMINDER variants already cover the rules;
+    // this extra header was a v3 reinforcement. Skip in tieredLight to save
+    // tokens; restore on parse miss (which forces full-echo mode anyway).
     const tc = s._turnCount || 0;
-    if (tc >= 30) {
-        lines.push(`\n⚠️ CRITICAL REMINDER (Turn ${tc}): This is a long chat. Re-read [ACTIVE VIR REGISTRY], [ESTABLISHED FACTS], and all [PERSONA] blocks before writing. Do not drift from established traits.`);
-    } else if (tc >= 10) {
-        lines.push(`\n📌 Reminder (Turn ${tc}): Follow [PERSONA], [VIR], and [ESTABLISHED FACTS] exactly.`);
+    if (!tieredLight) {
+        if (tc >= 30) {
+            lines.push(`\n⚠️ CRITICAL REMINDER (Turn ${tc}): This is a long chat. Re-read [ACTIVE VIR REGISTRY], [ESTABLISHED FACTS], and all [PERSONA] blocks before writing. Do not drift from established traits.`);
+        } else if (tc >= 10) {
+            lines.push(`\n📌 Reminder (Turn ${tc}): Follow [PERSONA], [VIR], and [ESTABLISHED FACTS] exactly.`);
+        }
     }
 
-    // ── v5: Active goal (TIER 1 — scene anchor) ──
-    if (s.active_goal) {
-        lines.push(`\n[ACTIVE GOAL]\n→ ${s.active_goal}`);
-    }
+    // (B.4: active_goal moved to top of TIER 1 — see earlier in this function)
 
     // ── v5: Established Facts (pinned truths — never contradict) ──
+    // Critical/high facts ALWAYS injected; normal facts gated by tieredLight.
     if (s.facts?.length) {
         const critFacts = s.facts.filter(f => f.priority === 'critical');
         const highFacts = s.facts.filter(f => f.priority === 'high');
@@ -1841,42 +2219,64 @@ function buildContext(s) {
         lines.push('\n[ESTABLISHED FACTS — LOCKED. Never contradict. Never reveal hidden facts prematurely.]');
         critFacts.forEach(f => lines.push(`  ⚠️ CRITICAL: ${f.text}`));
         highFacts.forEach(f => lines.push(`  📌 HIGH: ${f.text}`));
-        normFacts.forEach(f => lines.push(`  • ${f.text}`));
+        if (!tieredLight) {
+            normFacts.forEach(f => lines.push(`  • ${f.text}`));
+        }
     }
 
-    // ── v5: Persona cards (injected for NPCs in scene or all if compact) ──
+    // ── v5: Persona cards — B.5: compact mode after first appearance ──
+    // Strategy:
+    //   - First time we see an NPC's persona in this chat → emit FULL card
+    //     (voice + belief + forbidden + quirks + speech_example) and mark
+    //     them in s._seenPersonas so future turns shrink to compact.
+    //   - Subsequent turns → emit compact card (voice + forbidden ONLY).
+    //   - After a parse miss (or compactPersona toggle off) → full again.
     if (s.personas && Object.keys(s.personas).length) {
         const peopleHere = s.map?.peopleHere || [];
         const personasToShow = Object.entries(s.personas).filter(([nm]) =>
             peopleHere.length === 0 || peopleHere.includes(nm)
         );
         if (personasToShow.length) {
+            if (!s._seenPersonas) s._seenPersonas = {};
+            const useCompact = cfg.opts.compactPersona && (s._parseMisses || 0) === 0;
             for (const [nm, p] of personasToShow) {
+                const seen = s._seenPersonas[nm];
                 const parts = [];
-                if (p.voice)          parts.push(`Voice: ${p.voice}`);
-                if (p.core_belief)    parts.push(`Belief: ${p.core_belief}`);
-                if (p.forbidden)      parts.push(`FORBIDDEN: ${p.forbidden}`);
-                if (p.quirks)         parts.push(`Quirks: ${p.quirks}`);
-                if (p.speech_example) parts.push(`Example: "${p.speech_example}"`);
+                if (useCompact && seen) {
+                    // Compact form — just the dialogue/limit anchors
+                    if (p.voice)     parts.push(`Voice: ${p.voice}`);
+                    if (p.forbidden) parts.push(`FORBIDDEN: ${p.forbidden}`);
+                } else {
+                    // Full form — first appearance or recovery turn
+                    if (p.voice)          parts.push(`Voice: ${p.voice}`);
+                    if (p.core_belief)    parts.push(`Belief: ${p.core_belief}`);
+                    if (p.forbidden)      parts.push(`FORBIDDEN: ${p.forbidden}`);
+                    if (p.quirks)         parts.push(`Quirks: ${p.quirks}`);
+                    if (p.speech_example) parts.push(`Example: "${p.speech_example}"`);
+                    s._seenPersonas[nm] = true;
+                }
                 if (parts.length) lines.push(`\n[PERSONA: ${nm}]\n  ${parts.join('\n  ')}`);
             }
         }
     }
 
-    // ── v5: Key moments (for characters in scene) ──
+    // ── v5: Key moments (for characters in scene) — A.2: TIER-light skips ──
+    // In light mode only the last 2 moments are injected; full mode keeps 5.
     if (s.keyMoments?.length) {
         const peopleHere = s.map?.peopleHere || [];
         const relevant = peopleHere.length
             ? s.keyMoments.filter(m => !m.characters?.length || m.characters.some(c => peopleHere.includes(c)))
             : s.keyMoments;
-        const recent = relevant.slice(-5); // last 5 relevant moments
+        const sliceN = tieredLight ? 2 : 5;
+        const recent = relevant.slice(-sliceN);
         if (recent.length) {
             lines.push('\n[KEY MOMENTS — These have already happened. Do not contradict them.]');
             recent.forEach(m => lines.push(`  • (Turn ${m.turn}) ${m.text}`));
         }
     }
 
-    // ── v5: Relationship history (why scores are where they are) ──
+    // ── v5: Relationship history — A.2: skip history detail in light mode ──
+    // In tieredLight: emit only current scores (no _history events).
     if (s.relationships && Object.keys(s.relationships).length) {
         const peopleHere = s.map?.peopleHere || [];
         const relEntries = Object.entries(s.relationships).filter(([nm]) =>
@@ -1886,7 +2286,8 @@ function buildContext(s) {
             lines.push('\n[RELATIONSHIP CONTEXT]');
             for (const [nm, rel] of relEntries) {
                 const scores = ['trust','affection','fear'].filter(f => rel[f] !== undefined).map(f => `${f}:${rel[f]}`).join(', ');
-                const hist = (rel._history || []).slice(-3).map(h => `${h.delta > 0 ? '+' : ''}${h.delta} ${h.field}${h.reason ? ` (${h.reason})` : ''}`).join(' | ');
+                const hist = tieredLight ? ''
+                    : (rel._history || []).slice(-3).map(h => `${h.delta > 0 ? '+' : ''}${h.delta} ${h.field}${h.reason ? ` (${h.reason})` : ''}`).join(' | ');
                 if (scores) lines.push(`  ${nm}: ${scores}${hist ? ' — History: ' + hist : ''}`);
             }
         }
@@ -1916,25 +2317,599 @@ function buildContext(s) {
         lines.push(`\n⚠️ PARSE MISS WARNING: In the last ${tc} turns, ${s._parseMisses} response(s) had no \`\`\`rpg block. This is an error. Every response MUST end with a \`\`\`rpg block.`);
     }
 
-    // ── C.1: Story summaries (TIER 3 — background memory) ──
-    if (s._summaries?.length && budget === 'full') {
-        lines.push('\n[STORY SO FAR — Compressed history of earlier events]');
-        for (const sum of s._summaries) {
-            lines.push(`  [Turns ${sum.startTurn}–${sum.endTurn}]`);
-            sum.lines.forEach(l => lines.push(`    ${l}`));
+    // ── C.1: Story summaries — A.2: gated by tieredLight ──
+    // In tieredLight, skip — summary is only useful when AI needs full context
+    // for a fresh-start kind of turn (parse miss recovery, init).
+    if (!tieredLight) {
+        if (s._summaries?.length && budget === 'full') {
+            lines.push('\n[STORY SO FAR — Compressed history of earlier events]');
+            for (const sum of s._summaries) {
+                lines.push(`  [Turns ${sum.startTurn}–${sum.endTurn}]`);
+                sum.lines.forEach(l => lines.push(`    ${l}`));
+            }
+        } else if (s._summaries?.length && budget === 'standard') {
+            const last = s._summaries[s._summaries.length - 1];
+            lines.push(`\n[STORY SO FAR — Turns ${last.startTurn}–${last.endTurn}]`);
+            last.lines.slice(0, 5).forEach(l => lines.push(`  ${l}`));
         }
-    } else if (s._summaries?.length && budget === 'standard') {
-        // Compact: inject only the most recent summary
-        const last = s._summaries[s._summaries.length - 1];
-        lines.push(`\n[STORY SO FAR — Turns ${last.startTurn}–${last.endTurn}]`);
-        last.lines.slice(0, 5).forEach(l => lines.push(`  ${l}`));
     }
 
+    // ══ v4.1 TIER 4 DYNAMIC CUES (immersion injections) ════════════════════
+    // Small, situational, recency-anchored cues that fire only when the state
+    // crosses a meaningful threshold. Each is ≤30 tokens. Together they keep
+    // the AI's voice responsive to story shape without bloating context.
+
+    // ── Tonal cue: time + genre + tone in one line ──
+    const tonalBits = [];
+    if (s.time?.period) tonalBits.push(s.time.period);
+    if (s.combat?.active) tonalBits.push('combat imminent');
+    if (s.topics?.emotionalTone) tonalBits.push(s.topics.emotionalTone);
+    else if (s.mindset?.mood) tonalBits.push(`mood: ${s.mindset.mood}`);
+    if (tonalBits.length) lines.push(`\n[TONE] ${tonalBits.join(' | ')}`);
+
+    // ── NPC return callback: an NPC has just rejoined the scene after N+ turns away ──
+    const peopleHere = s.map?.peopleHere || [];
+    const returnCallbacks = [];
+    for (const name of peopleHere) {
+        const npc = (s.npcs||[]).find(n => n.name === name);
+        if (!npc) continue;
+        const lastSeen = s._npcLastSeenTurn?.[name];
+        if (lastSeen === undefined) continue;
+        const gap = (s._turnCount || 0) - lastSeen;
+        if (gap >= 4) {
+            const trustNote = npc.trust !== undefined ? ` trust=${npc.trust}` : '';
+            const lastMoment = (s.keyMoments || []).filter(m => m.characters?.includes(name)).slice(-1)[0];
+            const momentStr = lastMoment ? ` Last beat: "${lastMoment.text.slice(0,80)}"` : '';
+            returnCallbacks.push(`  • ${name} returns after ${gap} turns away.${trustNote}.${momentStr}`);
+        }
+    }
+    if (returnCallbacks.length) {
+        lines.push('\n[NPC RETURN — re-establish their continuity in your reply]');
+        returnCallbacks.forEach(l => lines.push(l));
+    }
+
+    // ── Stagnation nudge: active_goal hasn't changed in 5+ turns ──
+    if (s.active_goal && s._goalStartedTurn) {
+        const stale = (s._turnCount || 0) - s._goalStartedTurn;
+        if (stale >= 5) {
+            lines.push(`\n[PACING] Goal "${s.active_goal.slice(0,80)}" has been active for ${stale} turns. Consider an event that advances, complicates, or replaces it this turn.`);
+        }
+    }
+
+    // ── Time-skip detection: large jump in time vs last turn ──
+    if (s._lastTimeSnapshot && s.time) {
+        const prevH = (s._lastTimeSnapshot.day || 0) * 24 + (s._lastTimeSnapshot.hour || 0);
+        const nowH  = (s.time.day || 0) * 24 + (s.time.hour || 0);
+        const gapH  = nowH - prevH;
+        if (gapH >= 6) {
+            const desc = gapH >= 48 ? `${Math.floor(gapH/24)} days` : `${gapH} hours`;
+            lines.push(`\n[TIME ELAPSED: ${desc}] Off-scene NPCs progressed during the gap — untreated wounds worsened, training advanced, supplies dwindled. Reflect this in the reply if relevant.`);
+        }
+    }
+
+    // ── Relationship milestone callbacks: trust/affection crossed a tier ──
+    const MILESTONE_TIERS = [25, 50, 75, 90];
+    const MILESTONE_LABELS = {
+        25: 'tolerated', 50: 'trusted companion', 75: 'close ally', 90: 'devoted bond'
+    };
+    if (!s._milestonesHit) s._milestonesHit = {};
+    const milestoneLines = [];
+    for (const npc of (s.npcs || [])) {
+        for (const field of ['trust','affection']) {
+            const v = npc[field];
+            if (typeof v !== 'number') continue;
+            for (const tier of MILESTONE_TIERS) {
+                const key = `${npc.name}|${field}|${tier}`;
+                if (v >= tier && !s._milestonesHit[key]) {
+                    s._milestonesHit[key] = s._turnCount || 0;
+                    milestoneLines.push(`  • ${npc.name}'s ${field} crossed ${tier} — they are now ${MILESTONE_LABELS[tier]}. Their behaviour should shift visibly.`);
+                }
+            }
+        }
+    }
+    if (milestoneLines.length) {
+        lines.push('\n[MILESTONE — relationship threshold crossed this turn]');
+        milestoneLines.forEach(l => lines.push(l));
+    }
+
+    // ── Scene transition cue: location just changed ──
+    const curLoc = s.map?.currentLocation || s.location;
+    if (curLoc && s._lastLocation && curLoc !== s._lastLocation) {
+        lines.push(`\n[NEW SCENE: ${curLoc}] Open the scene with sensory detail — sight, smell, sound, temperature. Establish the place before action.`);
+    }
+
+    // ── NPC initiative reminder (always-on, very short) ──
+    if (peopleHere.length) {
+        lines.push(`\n[NPC INITIATIVE] NPCs in scene pursue their current_goal proactively. They act on their own agenda; they don't wait to be addressed.`);
+    }
+
+    // ── C.6: Per-chat rule overlay ──
+    if (s._ruleOverlay && s._ruleOverlay.trim()) {
+        lines.push(`\n[CHAT RULE OVERLAY]\n${s._ruleOverlay.trim()}`);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+
     lines.push("\n=== END STATE ===");
+
+    // ── Update tracking snapshots for next turn's cues ──
+    // (Done here so we capture this turn's state for next-turn comparison)
+    s._lastLocation = curLoc || s._lastLocation;
+    if (s.time) s._lastTimeSnapshot = { day: s.time.day, hour: s.time.hour };
+
     return lines.join("\n");
 }
 
+// ── A.5: Off-scene NPC keyword-gated lorebook entries ────────────────────────
+// Lazily imports world-info.js. Writes one lorebook entry per off-scene NPC,
+// keyed on their name (case-insensitive). Entries cost zero tokens until the
+// AI or the player mentions the NPC by name — same model as ff4-vir's
+// OFFSCREEN tier. Returns silently if the world-info module can't be loaded.
 
+let _wiAPI = null;            // cached world-info module exports
+let _wiLoadFailed = false;    // true once we've tried and failed
+const OFFSCENE_WORLD_PREFIX = 'RPG-HUD-Offscene-';
+
+async function loadWorldInfoAPI() {
+    if (_wiAPI || _wiLoadFailed) return _wiAPI;
+    try {
+        const mod = await import('../../../world-info.js');
+        if (mod && typeof mod.loadWorldInfo === 'function' && typeof mod.saveWorldInfo === 'function') {
+            _wiAPI = mod;
+        } else {
+            _wiLoadFailed = true;
+        }
+    } catch (e) {
+        console.warn('[st-rpg-hud] A.5: world-info.js import failed — offscene NPC lorebook disabled.', e);
+        _wiLoadFailed = true;
+    }
+    return _wiAPI;
+}
+
+function offsceneWorldName() {
+    const chatId = getChatId();
+    return OFFSCENE_WORLD_PREFIX + String(chatId).replace(/[<>:"/\\|?*]/g, '_').slice(0, 80);
+}
+
+function buildOffsceneNpcEntry(name, npc) {
+    const parts = [];
+    parts.push(`[NPC: ${name}] — currently off-scene`);
+    if (npc.role)         parts.push(`Role: ${npc.role}`);
+    if (npc.disposition)  parts.push(`Disposition: ${npc.disposition}`);
+    const relParts = ['trust','affection','fear','respect','hostility'].filter(f => npc[f] !== undefined && npc[f] !== 0).map(f => `${f}=${npc[f]}`);
+    if (relParts.length)  parts.push(`Relationship: ${relParts.join(', ')}`);
+    if (npc.outfit)       parts.push(`Wearing: ${npc.outfit}`);
+    if (npc.current_goal) parts.push(`Goal: ${npc.current_goal}`);
+    if (npc.lastSeenAt)   parts.push(`Last seen: ${npc.lastSeenAt}${npc.lastSeenTurn ? ' (turn '+npc.lastSeenTurn+')' : ''}`);
+    if (npc.note)         parts.push(`Note: ${npc.note}`);
+    return parts.join('\n');
+}
+
+async function syncOffsceneNpcs(s) {
+    const cfg = getCFG();
+    if (!cfg.opts.offSceneToLorebook) return;
+    if (!isEnabled()) return;
+    if (!Array.isArray(s.npcs) || !s.npcs.length) return;
+
+    const wi = await loadWorldInfoAPI();
+    if (!wi) return;
+
+    const worldName = offsceneWorldName();
+    const peopleHere = s.map?.peopleHere || [];
+    const offSceneNpcs = peopleHere.length
+        ? s.npcs.filter(n => n.name && !peopleHere.includes(n.name))
+        : [];
+
+    // Skip when nothing changed since last sync (light heuristic)
+    if (!s._lorebookOffscene) s._lorebookOffscene = {};
+    const currentOffscene = new Set(offSceneNpcs.map(n => n.name));
+    const tracked = new Set(Object.keys(s._lorebookOffscene));
+    const noChange = currentOffscene.size === tracked.size
+        && [...currentOffscene].every(n => tracked.has(n));
+    if (noChange && offSceneNpcs.every(n => {
+        const meta = s._lorebookOffscene[n.name];
+        return meta && meta.lastTurn === (s._turnCount || 0);
+    })) {
+        return;
+    }
+
+    let data;
+    try {
+        data = await wi.loadWorldInfo(worldName);
+    } catch(e) { data = null; }
+
+    if (!data || !data.entries) {
+        // Create a fresh world; world-info will lazily persist when we save
+        data = { entries: {} };
+    }
+
+    // Build a name → entry index from existing entries
+    const byName = {};
+    for (const [uid, entry] of Object.entries(data.entries || {})) {
+        if (!entry || !entry.comment) continue;
+        const m = entry.comment.match(/^NPC:\s*(.+)/i);
+        if (m) byName[m[1].trim().toLowerCase()] = { uid, entry };
+    }
+
+    let dirty = false;
+
+    // Upsert off-scene NPC entries
+    for (const npc of offSceneNpcs) {
+        if (!npc.name) continue;
+        const key = npc.name.toLowerCase();
+        const content = buildOffsceneNpcEntry(npc.name, npc);
+        const existing = byName[key];
+        if (existing) {
+            if (existing.entry.content !== content) {
+                existing.entry.content = content;
+                existing.entry.key = [npc.name, ...(npc.aliases || [])];
+                existing.entry.disable = false;
+                dirty = true;
+            }
+            s._lorebookOffscene[npc.name] = { uid: existing.uid, lastTurn: s._turnCount || 0 };
+        } else if (typeof wi.createWorldInfoEntry === 'function') {
+            const entry = wi.createWorldInfoEntry(worldName, data);
+            if (entry) {
+                entry.comment = `NPC: ${npc.name}`;
+                entry.content = content;
+                entry.key = [npc.name, ...(npc.aliases || [])];
+                entry.constant = false; // keyword-gated
+                entry.disable = false;
+                dirty = true;
+                s._lorebookOffscene[npc.name] = { uid: entry.uid, lastTurn: s._turnCount || 0 };
+            }
+        }
+    }
+
+    // Disable entries for NPCs no longer off-scene (they're either in scene
+    // now, or no longer tracked). Disabling rather than deleting preserves
+    // history if they leave again.
+    for (const [uid, entry] of Object.entries(data.entries || {})) {
+        if (!entry || !entry.comment) continue;
+        const m = entry.comment.match(/^NPC:\s*(.+)/i);
+        if (!m) continue;
+        const name = m[1].trim();
+        if (!currentOffscene.has(name) && !entry.disable) {
+            entry.disable = true;
+            dirty = true;
+            delete s._lorebookOffscene[name];
+        }
+    }
+
+    if (dirty) {
+        try {
+            await wi.saveWorldInfo(worldName, data, true);
+            // Make sure ST is using this world for the current chat. We only
+            // need to do this once per chat — check world_names cache.
+            if (Array.isArray(wi.world_names) && !wi.world_names.includes(worldName)) {
+                if (typeof wi.updateWorldInfoList === 'function') {
+                    try { await wi.updateWorldInfoList(); } catch(e) {}
+                }
+            }
+        } catch(e) {
+            console.warn('[st-rpg-hud] A.5: saveWorldInfo failed', e);
+        }
+    }
+}
+
+// ── v4.1 A.4: Export system prompt as keyword-gated lorebook ─────────────────
+// Splits system-prompt.md into 6 sections, writes each as a separate lorebook
+// entry: one constant (~350 tokens) + 5 keyword-gated (~0 tokens until topic
+// is mentioned in chat). Replaces the need to paste the full 3000-token system
+// prompt as a constant lorebook entry.
+//
+// Sections:
+//   RPG-RULES-CORE        — constant (always on): format + output order + first response init
+//   RPG-RULES-COMBAT      — keyword: combat, fight, attack, hp, ap, enemy
+//   RPG-RULES-QUEST       — keyword: quest, objective, mission, task, complete
+//   RPG-RULES-RELATIONSHIPS — keyword: trust, affection, fear, love, relationship
+//   RPG-RULES-VIR         — keyword: vir, outfit, appearance, hair, look
+//   RPG-RULES-WORLD       — keyword: faction, secret, threat, world, lore
+async function exportSystemPromptToLorebook() {
+    const wi = await loadWorldInfoAPI();
+    if (!wi) {
+        toastr?.error('world-info.js unavailable — cannot export.');
+        return;
+    }
+
+    const worldName = 'RPG-HUD-Rules';
+    const sections = [
+        {
+            name: 'CORE',
+            keys: [],
+            constant: true,
+            content: `[RPG STATE TRACKER — CORE]
+Every reply MUST end with exactly one \`\`\`rpg\`\`\` JSON block as the absolute last thing (after prose, after any <pic> tags).
+The block is valid JSON: NO comments, NO trailing commas, escape \\n inside strings.
+
+DELTA-ONLY MODE (default): emit ONLY fields that CHANGED this turn. The HUD merges deltas into stored state — unchanged fields stay as-is. If literally nothing changed, emit {}.
+When FULL_ECHO_REQUESTED appears in injected state: emit the complete state once.
+
+ALWAYS include when relevant: vitals, location (on change), active_goal, rel_event (when trust/affection/fear changes by >3).
+NEVER omit the \`\`\`rpg\`\`\` block — a substantive reply without it is malformed.
+
+[OUTPUT ORDER]
+1. Prose and dialogue
+2. Any <pic> image tags
+3. Any visible markdown blocks (e.g. ─── STATS UPDATE ───)
+4. The \`\`\`rpg\`\`\` block — ALWAYS LAST`
+        },
+        {
+            name: 'COMBAT',
+            keys: ['combat', 'fight', 'attack', 'hp', 'mp', 'ap', 'enemy', 'damage', 'weapon', 'spell'],
+            constant: false,
+            content: `[RPG COMBAT FIELDS]
+combat{"active":bool, "turn":n, "ap":n, "ap_max":n, "enemy":"Name"}
+vitals{"hp":[v,max], "mp":[v,max], "sta":[v,max]} — value cannot exceed max, cannot go below 0
+statuses[{"id":"poisoned","name":"Poisoned","type":"debuff","turns":3,"action":"add|remove"}]
+party[{"name":"AllyName","hp":100,"hp_max":100}]
+inventory[{"name":"...","action":"equip|use|remove","slot":"weapon|body|head"}]
+Outcomes proportional to stats and encounter scale.`
+        },
+        {
+            name: 'QUEST',
+            keys: ['quest', 'objective', 'mission', 'task', 'complete', 'fail', 'step', 'goal'],
+            constant: false,
+            content: `[RPG QUEST FIELDS]
+quests[{"id":"q1","action":"add|step|complete|fail","title":"...","desc":"...","step":"current step text"}]
+active_goal:"string"  — REQUIRED every turn; current scene objective in one sentence
+flags{"flag_id":{"label":"Human label","value":true}}  — persistent story flags
+scene_objects[{"id":"o1","name":"...","desc":"...","location":"...","action":"add|remove"}]  — props in scene; persist until explicitly removed`
+        },
+        {
+            name: 'RELATIONSHIPS',
+            keys: ['trust', 'affection', 'fear', 'love', 'relationship', 'romance', 'intimate', 'feelings'],
+            constant: false,
+            content: `[RPG RELATIONSHIP FIELDS]
+npcs[{"name":"X","disposition":"friendly|wary|neutral|hostile","trust":n,"affection":n,"fear":n,"respect":n,"hostility":n,"gratitude":n,"current_goal":"...","people_here":bool}]
+relationships{"Name":{"trust":65,"flags":["saved_my_life","knows_my_secret"]}}
+rel_event:"why this changed"  — REQUIRED when trust/affection/fear changes by >3
+
+DELTA LIMITS per turn: trust ±15 | affection ±12 | love ±10 | confidence ±20 | arousal ±30 | shame ±20 | fear ±15 | moral ±8
+RANGE: charInner 0–100. Vitals 0..max. Relationship fields -100..+100.
+
+charInner{"health":80,"moral":60,"confidence":55,"shame":20,"promiscuity":30,"arousal":15,"dependence":10,"love":5}
+charDev{"oral":0,"breasts":0,"masochism":0,"caressing":0}
+mindset{"mood":"anxious","thoughts":"..."}
+vad{"Name":{"valence":40,"arousal":60,"dominance":35}}`
+        },
+        {
+            name: 'VIR',
+            keys: ['vir', 'outfit', 'appearance', 'hair', 'look', 'wears', 'wearing', 'eyes', 'scars'],
+            constant: false,
+            content: `[RPG VIR FIELDS — Visual Identity Registry]
+vir{<name>:{species_class,age_appearance,height,hair{length,style,color_shade,bangs,default_accessories[]},eyes{color,shape},skin{tone,texture},body{archetype,build,bust,waist_to_hip},non_human{tail,wings,horns,ears},marks{scars[],tattoos[],moles[],piercings[]},outfit[{slot,item_type,color,material,cut,detail,condition}],accessories[{type,material,detail}]}}
+vir_changes{<name>:{<dotted.path>:<new value>}}  — for surgical updates without rewriting full nested object
+outfit_change{<name>:{removed:[{slot,item_type}], added:[<full piece object>]}}
+
+VIR LOCK: once introduced, a character persists in vir{} forever. Never drop, never contradict their stored appearance.
+Off-scene → active:false. Death → status:"deceased". Re-entry → flip active:true, copy verbatim.
+Appearance change requires a narrated story event (haircut, injury, dye job) AND a vir/vir_changes delta.`
+        },
+        {
+            name: 'WORLD',
+            keys: ['faction', 'secret', 'threat', 'world', 'lore', 'kingdom', 'guild', 'history'],
+            constant: false,
+            content: `[RPG WORLD FIELDS]
+factions[{"name":"The Guild","rep":50,"status":"friendly|neutral|hostile"}]
+npc_relations[{"from":"Mika","to":"Lord Shen","type":"rivals|enemies|allies|lovers|mentor"}]
+secrets[{"id":"s1","title":"...","text":"...","revealed":bool}]
+open_threats[{"source":"...","nature":"...","trigger":"..."}]
+facts[{"id":"f1","text":"...","priority":"critical|high|normal"}]  — pinned truths AI must never contradict
+topics{"genre":"fantasy|romance|horror|tactical|scifi","primaryTopic":"...","emotionalTone":"...","interactionTheme":"..."}
+key_moment:"defining story beat"  — max one per response, only when something pivotal happens`
+        },
+    ];
+
+    let data;
+    try { data = await wi.loadWorldInfo(worldName); } catch(e) { data = null; }
+    if (!data || !data.entries) data = { entries: {} };
+
+    // Clear out old RPG-RULES-* entries by name (idempotent re-export)
+    for (const [uid, entry] of Object.entries(data.entries || {})) {
+        if (entry?.comment?.startsWith('RPG-RULES-')) {
+            entry.disable = true; // soft-clear so old entries don't fire
+        }
+    }
+
+    let count = 0;
+    for (const sec of sections) {
+        if (typeof wi.createWorldInfoEntry !== 'function') continue;
+        const entry = wi.createWorldInfoEntry(worldName, data);
+        if (!entry) continue;
+        entry.comment = `RPG-RULES-${sec.name}`;
+        entry.content = sec.content;
+        entry.key = sec.keys;
+        entry.constant = sec.constant;
+        entry.disable = false;
+        count++;
+    }
+
+    try {
+        await wi.saveWorldInfo(worldName, data, true);
+        if (typeof wi.updateWorldInfoList === 'function') {
+            try { await wi.updateWorldInfoList(); } catch(e) {}
+        }
+        toastr?.success(`Exported ${count} rule sections to lorebook "${worldName}". Enable it in World Info → ${worldName}.`, 'RPG HUD A.4', { timeOut: 6000 });
+        return worldName;
+    } catch(e) {
+        toastr?.error('Save failed: ' + e.message);
+        console.warn('[st-rpg-hud] A.4 export failed', e);
+    }
+}
+
+// ── v4.1 C.3: Slash command registration ─────────────────────────────────────
+// Power-user GM tools. Registered lazily because the slash-command API may
+// not be available in all ST versions; failures degrade silently.
+let _slashRegistered = false;
+async function registerSlashCommands() {
+    if (_slashRegistered) return;
+    try {
+        const SP = await import('../../../slash-commands/SlashCommandParser.js');
+        const SC = await import('../../../slash-commands/SlashCommand.js');
+        const SCA = await import('../../../slash-commands/SlashCommandArgument.js');
+        const { SlashCommandParser } = SP;
+        const { SlashCommand } = SC;
+        const { SlashCommandArgument, ARGUMENT_TYPE } = SCA;
+
+        const add = (props) => {
+            try { SlashCommandParser.addCommandObject(SlashCommand.fromProps(props)); }
+            catch(e) { console.warn('[st-rpg-hud] slash command failed', props.name, e); }
+        };
+
+        add({
+            name: 'rpg-status',
+            callback: () => {
+                if (!isEnabled()) return 'RPG HUD not enabled for this chat.';
+                const s = getState();
+                const npcCount = (s.npcs||[]).length;
+                const hereCount = (s.map?.peopleHere||[]).length;
+                const lines = [
+                    `Turn: ${s._turnCount||0} | Location: ${s.map?.currentLocation||s.location||'?'}`,
+                    `Goal: ${s.active_goal || '(none)'}`,
+                    `NPCs tracked: ${npcCount} (${hereCount} in scene)`,
+                    `Quests active: ${(s.quests||[]).filter(q=>q.status==='active').length}`,
+                    `Parse misses: ${s._parseMisses||0} | Last full echo: turn ${s._lastFullEchoTurn||0}`,
+                ];
+                return lines.join(' | ');
+            },
+            helpString: 'Show a one-line RPG HUD state summary.',
+        });
+
+        add({
+            name: 'rpg-goal',
+            callback: (_args, value) => {
+                if (!isEnabled()) return '';
+                const s = getState();
+                const newGoal = String(value || '').trim();
+                if (!newGoal) return `Current goal: ${s.active_goal || '(none)'}`;
+                if (newGoal !== s.active_goal) s._goalStartedTurn = s._turnCount || 0;
+                s.active_goal = newGoal;
+                saveState();
+                updatePrompt();
+                scheduleRender?.();
+                return `Goal set: ${newGoal}`;
+            },
+            unnamedArgumentList: [SlashCommandArgument.fromProps({ description: 'new active_goal text', typeList: [ARGUMENT_TYPE.STRING], isRequired: false })],
+            helpString: 'Set the active_goal directly. Without args, prints the current goal.',
+        });
+
+        add({
+            name: 'rpg-fact',
+            callback: (_args, value) => {
+                if (!isEnabled()) return '';
+                const s = getState();
+                if (!s.facts) s.facts = [];
+                const arg = String(value || '').trim();
+                if (arg.toLowerCase().startsWith('remove ')) {
+                    const id = arg.slice(7).trim();
+                    s.facts = s.facts.filter(f => f.id !== id);
+                    saveState(); updatePrompt();
+                    return `Removed fact "${id}".`;
+                }
+                if (arg.toLowerCase().startsWith('add ')) {
+                    const text = arg.slice(4).trim();
+                    const id = 'f' + Date.now().toString(36);
+                    s.facts.push({ id, text, priority: 'normal' });
+                    saveState(); updatePrompt();
+                    return `Added fact ${id}: ${text}`;
+                }
+                if (!arg) return `${s.facts.length} facts tracked.`;
+                return `Use: /rpg-fact add <text> | /rpg-fact remove <id>`;
+            },
+            unnamedArgumentList: [SlashCommandArgument.fromProps({ description: '"add <text>" or "remove <id>"', typeList: [ARGUMENT_TYPE.STRING], isRequired: false })],
+            helpString: 'Add or remove pinned facts. "/rpg-fact add She is the queen\'s daughter" or "/rpg-fact remove f1".',
+        });
+
+        add({
+            name: 'rpg-echo',
+            callback: () => {
+                if (!isEnabled()) return '';
+                const s = getState();
+                s._parseMisses = (s._parseMisses || 0) + 1; // forces full reminder + full echo
+                s._lastFullEchoTurn = 0;
+                saveState(); updatePrompt();
+                return 'Next generation will request a FULL ECHO of state.';
+            },
+            helpString: 'Force the next AI turn to emit a complete state echo (for drift recovery).',
+        });
+
+        add({
+            name: 'rpg-recall',
+            callback: (_args, value) => {
+                if (!isEnabled()) return '';
+                const s = getState();
+                const name = String(value || '').trim();
+                if (!name) return `Tracked: ${(s.npcs||[]).map(n=>n.name).join(', ')||'(none)'}`;
+                const npc = (s.npcs||[]).find(n => n.name.toLowerCase() === name.toLowerCase());
+                if (!npc) return `No NPC named "${name}" tracked.`;
+                const lastSeen = s._npcLastSeenTurn?.[npc.name];
+                const gap = lastSeen !== undefined ? (s._turnCount || 0) - lastSeen : '?';
+                const moments = (s.keyMoments||[]).filter(m => m.characters?.includes(npc.name)).slice(-3);
+                const lines = [
+                    `${npc.name} (${npc.role||'?'}, ${npc.disposition||'neutral'})`,
+                    `Trust=${npc.trust??0} Affection=${npc.affection??0} Fear=${npc.fear??0}`,
+                    `Last seen: turn ${lastSeen??'?'} (${gap} turns ago)`,
+                    npc.note ? `Note: ${npc.note}` : '',
+                    npc.current_goal ? `Goal: ${npc.current_goal}` : '',
+                    moments.length ? `Recent beats:\n${moments.map(m => `  • T${m.turn}: ${m.text}`).join('\n')}` : '',
+                ].filter(Boolean);
+                return lines.join('\n');
+            },
+            unnamedArgumentList: [SlashCommandArgument.fromProps({ description: 'NPC name', typeList: [ARGUMENT_TYPE.STRING], isRequired: false })],
+            helpString: 'Show a quick recall card for an NPC: stats, last seen, last beats.',
+        });
+
+        add({
+            name: 'rpg-skip',
+            callback: (_args, value) => {
+                if (!isEnabled()) return '';
+                const s = getState();
+                const arg = String(value || '').trim();
+                const m = arg.match(/^(\d+)\s*(h|hours?|d|days?)$/i);
+                if (!m) return 'Use: /rpg-skip 3h  OR  /rpg-skip 2 days';
+                const n = parseInt(m[1]);
+                const unit = m[2][0].toLowerCase();
+                if (!s.time) s.time = { day: 1, hour: 12, period: 'day' };
+                if (unit === 'h') {
+                    let h = (s.time.hour || 0) + n;
+                    s.time.day = (s.time.day || 1) + Math.floor(h / 24);
+                    s.time.hour = h % 24;
+                } else {
+                    s.time.day = (s.time.day || 1) + n;
+                }
+                // Force a time-skip cue next turn by clearing the snapshot
+                s._lastTimeSnapshot = null;
+                saveState(); updatePrompt();
+                return `Time advanced by ${n}${unit === 'h' ? 'h' : 'd'}. Next turn will include a TIME ELAPSED cue.`;
+            },
+            unnamedArgumentList: [SlashCommandArgument.fromProps({ description: 'amount + unit (e.g. "3h" or "2 days")', typeList: [ARGUMENT_TYPE.STRING], isRequired: true })],
+            helpString: 'Skip in-world time. Triggers off-screen progression on next generation.',
+        });
+
+        add({
+            name: 'rpg-pin',
+            callback: (_args, value) => {
+                if (!isEnabled()) return '';
+                const s = getState();
+                const text = String(value || '').trim();
+                if (!text) return 'Use: /rpg-pin <text to remember>';
+                const id = 'p' + Date.now().toString(36);
+                s.facts = s.facts || [];
+                s.facts.push({ id, text, priority: 'high' });
+                saveState(); updatePrompt();
+                return `Pinned (high priority): ${text}`;
+            },
+            unnamedArgumentList: [SlashCommandArgument.fromProps({ description: 'text to pin', typeList: [ARGUMENT_TYPE.STRING], isRequired: true })],
+            helpString: 'Pin a high-priority fact. Quick alternative to /rpg-fact add.',
+        });
+
+        _slashRegistered = true;
+        console.log('[st-rpg-hud] Slash commands registered: /rpg-status /rpg-goal /rpg-fact /rpg-echo /rpg-recall /rpg-skip /rpg-pin');
+    } catch (e) {
+        console.warn('[st-rpg-hud] Slash commands unavailable in this ST version', e);
+    }
+}
 
 function updatePrompt() {
     const ctx = getContext();
@@ -2125,6 +3100,25 @@ function doRender() {
     const s = getState();
     const gm = getCFG().opts?.gmEdit || false;
     const chatId = getChatId();
+
+    // ── v4.1: Auto-tone classes on wrapper for CSS mood theming ─────────────
+    // Period: morning/afternoon/evening/night → rpg-tone-time-<period>
+    // Combat active → rpg-tone-combat
+    // Genre → rpg-tone-genre-<genre>
+    // Tone → rpg-tone-mood-<tone>  (sanitized)
+    {
+        const sanitize = v => String(v||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,20);
+        const period = sanitize(s.time?.period);
+        const genre  = sanitize(s.topics?.genre);
+        const tone   = sanitize(s.topics?.emotionalTone || s.mindset?.mood);
+        const combat = !!s.combat?.active;
+        // Strip prior tone classes then re-add
+        Array.from(w.classList).forEach(c => { if (c.startsWith('rpg-tone-')) w.classList.remove(c); });
+        if (period) w.classList.add('rpg-tone-time-' + period);
+        if (genre)  w.classList.add('rpg-tone-genre-' + genre);
+        if (tone)   w.classList.add('rpg-tone-mood-' + tone);
+        if (combat) w.classList.add('rpg-tone-combat');
+    }
 
     // ── location ──────────────────────────────────────────────
     const lEl=w.querySelector('#rpg-location-val'); if(lEl) lEl.textContent=s.map?.currentLocation||s.location||'Unknown';
@@ -2539,7 +3533,41 @@ function doRender() {
         const curLoc = s.map?.currentLocation||s.location||"Unknown";
         const here = (s.npcs||[]).filter(n=>n.location&&n.location.toLowerCase()===curLoc.toLowerCase());
         if (!here.length) { pplEl.innerHTML='<span class="rpg-empty">Nobody notable here.</span>'; }
-        else { pplEl.innerHTML=here.map(n=>`<span class="rpg-pill" style="background:rgba(82,148,200,0.12);border:1px solid rgba(82,148,200,0.3);color:var(--hud-info)">${esc(n.name)}</span>`).join(''); }
+        else {
+            // v4.1 C.2: color-code by disposition; tooltip shows trust/affection
+            const DISP_COLORS = {
+                friendly: { bg: 'rgba(82,200,122,0.15)', bd: 'rgba(82,200,122,0.4)', fg: '#74d18f' },
+                wary:     { bg: 'rgba(220,170,60,0.15)', bd: 'rgba(220,170,60,0.4)', fg: '#dcaa3c' },
+                neutral:  { bg: 'rgba(82,148,200,0.12)', bd: 'rgba(82,148,200,0.3)', fg: '#7eaccc' },
+                hostile:  { bg: 'rgba(220,80,80,0.15)',  bd: 'rgba(220,80,80,0.4)',  fg: '#e57373' },
+            };
+            pplEl.innerHTML = here.map(n => {
+                const d = DISP_COLORS[n.disposition] || DISP_COLORS.neutral;
+                const tipBits = [];
+                if (n.trust !== undefined)     tipBits.push(`trust=${n.trust}`);
+                if (n.affection !== undefined) tipBits.push(`affection=${n.affection}`);
+                if (n.fear !== undefined && n.fear !== 0) tipBits.push(`fear=${n.fear}`);
+                const tip = `${n.disposition||'neutral'}${tipBits.length?' | '+tipBits.join(' '):''}${n.note?' | '+n.note:''}`;
+                return `<span class="rpg-pill" title="${esc(tip)}" style="background:${d.bg};border:1px solid ${d.bd};color:${d.fg}">${esc(n.name)}</span>`;
+            }).join('');
+        }
+    }
+
+    // v4.1 C.2: Travel breadcrumb shows last 5 hops with arrows
+    const travelEl = w.querySelector('#rpg-travel-log');
+    if (travelEl) {
+        const log = s.map?.travelLog || [];
+        if (!log.length) {
+            travelEl.innerHTML = '<span class="rpg-empty">No travel history yet.</span>';
+        } else {
+            const cur = s.map?.currentLocation || s.location || '?';
+            const trail = [...log.slice(0,5).reverse(), cur];
+            travelEl.innerHTML = trail.map((l, i) => {
+                const isLast = i === trail.length - 1;
+                const style = isLast ? 'font-weight:600;color:var(--hud-info);' : 'opacity:.7;';
+                return `<span style="${style}">${esc(l)}</span>`;
+            }).join(' <span style="opacity:.5;">→</span> ');
+        }
     }
 
     // ── factions ──────────────────────────────────────────────
@@ -2626,6 +3654,59 @@ function doRender() {
     if (clearBtn && !clearBtn.dataset.bound) {
         clearBtn.dataset.bound = '1';
         clearBtn.addEventListener('click', () => { const st = getState(); st._contradictions = []; saveState(); scheduleRender(); });
+    }
+
+    // ── v4.1 C.1: World Simulation tab ───────────────────────────
+    const simOffEl = w.querySelector('#rpg-sim-offscene');
+    if (simOffEl) {
+        const peopleHere = new Set(s.map?.peopleHere || []);
+        const off = (s.npcs || []).filter(n => n.name && !peopleHere.has(n.name));
+        if (!off.length) {
+            simOffEl.innerHTML = '<span class="rpg-empty">No off-scene NPCs.</span>';
+        } else {
+            const tNow = s._turnCount || 0;
+            const html = off.map(n => {
+                const lastSeen = s._npcLastSeenTurn?.[n.name];
+                const gap = lastSeen !== undefined ? ` <span style="opacity:.6;font-size:11px;">(${tNow - lastSeen}t ago)</span>` : '';
+                const lastLoc = n.lastSeenAt ? ` <span style="opacity:.6;font-size:11px;">@ ${esc(n.lastSeenAt)}</span>` : '';
+                const note = n.note ? `<div style="opacity:.8;font-size:11px;margin-top:2px;">${esc(n.note)}</div>` : '';
+                const goal = n.current_goal ? `<div style="opacity:.7;font-size:11px;margin-top:2px;"><i class="fa-solid fa-crosshairs"></i> ${esc(n.current_goal)}</div>` : '';
+                return `<div class="rpg-sim-row" style="padding:6px 8px;margin-bottom:4px;border-left:3px solid var(--border-color);background:rgba(0,0,0,.08);border-radius:3px;"><div><strong>${esc(n.name)}</strong>${gap}${lastLoc} <span style="opacity:.6;font-size:11px;">trust=${n.trust??0}</span></div>${goal}${note}</div>`;
+            }).join('');
+            simOffEl.innerHTML = html;
+        }
+    }
+    const simStatsEl = w.querySelector('#rpg-sim-stats');
+    if (simStatsEl) {
+        const feed = (s._statsUpdate || []).slice(-8).reverse();
+        if (!feed.length) {
+            simStatsEl.innerHTML = '<span class="rpg-empty">No stat events parsed yet.</span>';
+        } else {
+            const html = feed.map(blk => {
+                const events = blk.events.slice(0, 12).map(ev => {
+                    const arrow = ev.newV > ev.oldV ? '↑' : ev.newV < ev.oldV ? '↓' : '·';
+                    const color = ev.newV > ev.oldV ? '#52c87a' : ev.newV < ev.oldV ? '#e57373' : '#888';
+                    return `<div style="font-size:11px;margin-left:8px;"><span style="color:${color};">${arrow}</span> <strong>${esc(ev.character||'?')}</strong>: ${esc(ev.stat)} ${ev.oldV}→${ev.newV}${ev.reason ? ' <span style="opacity:.7;">— ' + esc(ev.reason) + '</span>' : ''}</div>`;
+                }).join('');
+                return `<div style="margin-bottom:6px;"><div style="font-size:11px;opacity:.6;">Turn ${blk.turn}</div>${events}</div>`;
+            }).join('');
+            simStatsEl.innerHTML = html;
+        }
+    }
+    const simMilestonesEl = w.querySelector('#rpg-sim-milestones');
+    if (simMilestonesEl) {
+        const milestones = Object.entries(s._milestonesHit || {})
+            .sort(([,a],[,b]) => b - a)
+            .slice(0, 10);
+        if (!milestones.length) {
+            simMilestonesEl.innerHTML = '<span class="rpg-empty">No milestones hit yet.</span>';
+        } else {
+            const html = milestones.map(([key, turn]) => {
+                const [name, field, tier] = key.split('|');
+                return `<div style="font-size:11px;margin-bottom:2px;"><span style="opacity:.5;">T${turn}</span> <strong>${esc(name)}</strong> ${esc(field)} crossed ${tier}</div>`;
+            }).join('');
+            simMilestonesEl.innerHTML = html;
+        }
     }
 
     // ── active goal strip (always-visible banner) ─────────────
@@ -3320,6 +4401,41 @@ function addSettingsPanel() {
                 <label class="checkbox_label" style="margin-top:4px;" title="Use multi-pass JSON repair (strip comments, trailing commas, truncate-at-last-balanced-brace).">
                     <input type="checkbox" id="rpg-hud-jsonrepair" ${cfg.opts.aggressiveJsonRepair!==false?'checked':''}/> Aggressive JSON repair
                 </label>
+                <hr style="margin:8px 0;border:0;border-top:1px solid var(--border-color);">
+                <div style="font-size:11px;opacity:0.7;margin-bottom:4px;">⚡ Token-saver settings (v4 plan)</div>
+                <label class="checkbox_label" style="margin-top:4px;" title="AI emits only changed fields each turn (delta-only). HUD merges deltas into stored state. Heartbeat triggers a full echo every N turns or after a parse miss.">
+                    <input type="checkbox" id="rpg-hud-deltaonly" ${cfg.opts.deltaOnly!==false?'checked':''}/> Delta-only rpg blocks (A.1)
+                </label>
+                <label class="checkbox_label" style="margin-top:4px;" title="Adaptive FORMAT_REMINDER: minimal schema on steady-state turns, full schema on first turn / after parse miss. Saves ~300 tokens/turn.">
+                    <input type="checkbox" id="rpg-hud-adaptivereminder" ${cfg.opts.adaptiveReminder!==false?'checked':''}/> Adaptive FORMAT_REMINDER (A.3)
+                </label>
+                <label class="checkbox_label" style="margin-top:4px;" title="Tiered state injection: TIER 1 (vitals/loc/goal) always; heavy blocks (story summaries, full relationship history, urgency header) only on full-echo turns. Saves ~200–500 tokens/turn.">
+                    <input type="checkbox" id="rpg-hud-tiered" ${cfg.opts.tieredInjection!==false?'checked':''}/> Tiered state injection (A.2)
+                </label>
+                <label class="checkbox_label" style="margin-top:4px;" title="Write off-scene NPCs to a keyword-gated lorebook entry. Zero tokens until their name is mentioned in chat. Requires world-info.js (built into ST).">
+                    <input type="checkbox" id="rpg-hud-offscene-lorebook" ${cfg.opts.offSceneToLorebook!==false?'checked':''}/> Off-scene NPCs → lorebook (A.5)
+                </label>
+                <label class="checkbox_label" style="margin-top:4px;" title="Show full persona only on first appearance and after parse misses. Subsequent turns show compact form (voice + forbidden only).">
+                    <input type="checkbox" id="rpg-hud-compactpersona" ${cfg.opts.compactPersona!==false?'checked':''}/> Compact personas after first show (B.5)
+                </label>
+                <label style="margin-top:6px;display:block;">Heartbeat (full echo every N turns):
+                    <input type="number" id="rpg-hud-heartbeat" class="text_pole" value="${cfg.opts.heartbeatInterval||10}" min="2" max="50" style="width:55px;margin-left:6px;"/>
+                </label>
+                <label style="margin-top:6px;display:block;">VIR mode:
+                    <select id="rpg-hud-virmode" class="text_pole" style="margin-left:6px;">
+                        <option value="self"   ${(!cfg.opts.virMode||cfg.opts.virMode==='self')?'selected':''}>Self-contained (default)</option>
+                        <option value="bridge" ${cfg.opts.virMode==='bridge'?'selected':''}>Bridge to ff4-vir-lorebook-sync</option>
+                        <option value="off"    ${cfg.opts.virMode==='off'?'selected':''}>Off (no VIR in RPG HUD)</option>
+                    </select>
+                </label>
+                <hr style="margin:8px 0;border:0;border-top:1px solid var(--border-color);">
+                <div style="font-size:11px;opacity:0.7;margin-bottom:4px;">📚 Rule lorebook (v4.1 A.4)</div>
+                <div style="font-size:11px;opacity:0.8;margin-bottom:6px;">Splits the system prompt into 6 lorebook entries: CORE always-on (~350 tok) + 5 keyword-gated topic sections (0 tok until mentioned). Saves ~2000 tokens/turn vs pasting the full system-prompt.md as constant.</div>
+                <button class="menu_button" id="rpg-export-rules-btn"><i class="fa-solid fa-book"></i> Export rules to lorebook</button>
+                <hr style="margin:8px 0;border:0;border-top:1px solid var(--border-color);">
+                <div style="font-size:11px;opacity:0.7;margin-bottom:4px;">📝 Per-chat rule overlay (v4.1 C.6)</div>
+                <div style="font-size:11px;opacity:0.8;margin-bottom:6px;">Extra rules injected at TIER 4 for this chat only. Use for genre tone, table conventions, or one-off house rules.</div>
+                <textarea id="rpg-hud-overlay" class="text_pole" rows="3" placeholder="e.g. This chat is HORROR — maintain dread tone; no comic relief. Sensory detail prioritised over combat math." style="width:100%;font-size:12px;font-family:inherit;">${esc(getState()._ruleOverlay || '')}</textarea>
                 <label style="margin-top:6px;">Theme:
                     <select id="rpg-hud-theme" class="text_pole" style="margin-left:6px;">
                         <option value="" ${!cfg.opts.theme?'selected':''}>Default (Gold)</option>
@@ -3370,6 +4486,16 @@ function addSettingsPanel() {
     document.getElementById('rpg-hud-budget')?.addEventListener('change', e => { getCFG().opts.budget=e.target.value; getContext().saveSettingsDebounced(); updatePrompt(); });
     document.getElementById('rpg-hud-keepdeceased')?.addEventListener('change', e => { getCFG().opts.keepDeceasedInRoster=e.target.checked; getContext().saveSettingsDebounced(); });
     document.getElementById('rpg-hud-jsonrepair')?.addEventListener('change', e => { getCFG().opts.aggressiveJsonRepair=e.target.checked; getContext().saveSettingsDebounced(); });
+    // v4 token-saver toggles
+    document.getElementById('rpg-hud-deltaonly')?.addEventListener('change', e => { getCFG().opts.deltaOnly=e.target.checked; getContext().saveSettingsDebounced(); updatePrompt(); });
+    document.getElementById('rpg-hud-adaptivereminder')?.addEventListener('change', e => { getCFG().opts.adaptiveReminder=e.target.checked; getContext().saveSettingsDebounced(); updatePrompt(); });
+    document.getElementById('rpg-hud-tiered')?.addEventListener('change', e => { getCFG().opts.tieredInjection=e.target.checked; getContext().saveSettingsDebounced(); updatePrompt(); });
+    document.getElementById('rpg-hud-offscene-lorebook')?.addEventListener('change', e => { getCFG().opts.offSceneToLorebook=e.target.checked; getContext().saveSettingsDebounced(); });
+    document.getElementById('rpg-hud-compactpersona')?.addEventListener('change', e => { getCFG().opts.compactPersona=e.target.checked; getContext().saveSettingsDebounced(); updatePrompt(); });
+    document.getElementById('rpg-hud-heartbeat')?.addEventListener('change', e => { getCFG().opts.heartbeatInterval=Math.max(2, parseInt(e.target.value)||10); getContext().saveSettingsDebounced(); });
+    document.getElementById('rpg-hud-virmode')?.addEventListener('change', e => { getCFG().opts.virMode=e.target.value; getContext().saveSettingsDebounced(); updatePrompt(); });
+    document.getElementById('rpg-export-rules-btn')?.addEventListener('click', async () => { try { await exportSystemPromptToLorebook(); } catch(e) { toastr?.error('Export failed: '+e.message); } });
+    document.getElementById('rpg-hud-overlay')?.addEventListener('input', e => { getState()._ruleOverlay = e.target.value; saveState(); updatePrompt(); });
     document.getElementById('rpg-export-btn')?.addEventListener('click', () => {
         const blob = new Blob([JSON.stringify(getState(),null,2)], {type:'application/json'});
         const a = document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=`rpg-hud-${getChatId()}.json`; a.click();
@@ -3472,7 +4598,10 @@ function addSettingsPanel() {
             if (cb) cb.checked = isEnabled();
         });
 
-        if (typeof toastr !== 'undefined') toastr.success("RPG HUD v4.0 Loaded!", "Debug", {timeOut: 3000});
+        // v4.1: register slash commands (lazy-imports ST's slash command API)
+        try { registerSlashCommands(); } catch(e) { console.warn('[st-rpg-hud] slash command registration failed', e); }
+
+        if (typeof toastr !== 'undefined') toastr.success("RPG HUD v4.1 Loaded!", "Debug", {timeOut: 3000});
     } catch(e) {
         console.error("[st-rpg-hud] UI Rendering Error:", e);
         if (typeof toastr !== 'undefined') toastr.error("RPG HUD Error: " + e.message, "Debug", {timeOut: 10000});

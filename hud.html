@@ -38,6 +38,9 @@
         <div class="rpg-hud-tab" data-target="panel-journal">
             <i class="fa-solid fa-book-open"></i> Journal
         </div>
+        <div class="rpg-hud-tab" data-target="panel-sim" title="World Simulation — off-screen NPC progress + stats feed">
+            <i class="fa-solid fa-globe"></i> Sim
+        </div>
         <div class="rpg-hud-tab" id="rpg-gm-toggle" title="GM Edit Mode">
             <i class="fa-solid fa-pen-to-square"></i>
         </div>
@@ -225,6 +228,18 @@
                 </div>
                 <div id="rpg-contradiction-list"></div>
             </div>
+        </div>
+
+        <!-- Panel 11: World Simulation (v4.1 C.1) -->
+        <div id="panel-sim" class="rpg-hud-panel">
+            <div class="rpg-section-heading"><i class="fa-solid fa-house-medical"></i> Off-Scene NPCs</div>
+            <div id="rpg-sim-offscene"><span class="rpg-empty">No off-scene NPCs.</span></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-chart-line"></i> Stats Feed (STATS UPDATE blocks)</div>
+            <div id="rpg-sim-stats"><span class="rpg-empty">No stat events parsed yet.</span></div>
+
+            <div class="rpg-section-heading"><i class="fa-solid fa-clock-rotate-left"></i> Recent Milestones</div>
+            <div id="rpg-sim-milestones"><span class="rpg-empty">No milestones hit yet.</span></div>
         </div>
 
     </div>

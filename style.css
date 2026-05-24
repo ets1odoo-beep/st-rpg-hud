@@ -1884,3 +1884,20 @@
     font-weight: 600;
     opacity: 0.7;
 }
+
+/* v4.1: Auto-tone classes — subtle mood shifts based on scene state */
+.rpg-tone-time-night        { box-shadow: inset 0 0 0 1px rgba(50, 70, 120, 0.18); }
+.rpg-tone-time-evening      { box-shadow: inset 0 0 0 1px rgba(180, 120, 70, 0.15); }
+.rpg-tone-time-morning      { box-shadow: inset 0 0 0 1px rgba(255, 220, 150, 0.12); }
+.rpg-tone-combat            { box-shadow: inset 0 0 0 2px rgba(220, 50, 50, 0.45); animation: rpg-combat-pulse 1.6s ease-in-out infinite; }
+@keyframes rpg-combat-pulse { 0%,100% { box-shadow: inset 0 0 0 2px rgba(220,50,50,.35); } 50% { box-shadow: inset 0 0 0 2px rgba(220,50,50,.6); } }
+.rpg-tone-genre-horror      { background: linear-gradient(180deg, rgba(40,5,10,0.10), transparent 30%); }
+.rpg-tone-genre-romance     { background: linear-gradient(180deg, rgba(60,20,40,0.12), transparent 30%); }
+.rpg-tone-genre-tactical    { background: linear-gradient(180deg, rgba(20,40,20,0.10), transparent 30%); }
+.rpg-tone-mood-tense        { box-shadow: inset 0 0 0 1px rgba(200, 100, 50, 0.30); }
+.rpg-tone-mood-intimate     { background: linear-gradient(180deg, rgba(60,30,40,0.10), transparent 25%); }
+.rpg-tone-mood-mournful     { filter: saturate(0.85); }
+
+/* v4.1 C.1: Sim panel rows */
+.rpg-sim-row                { transition: background 0.2s; }
+.rpg-sim-row:hover          { background: rgba(255,255,255,0.04) !important; }

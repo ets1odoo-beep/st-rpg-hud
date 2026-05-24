@@ -7,6 +7,6 @@
     "js": "index.js",
     "css": "style.css",
     "author": "System",
-    "version": "3.0.0",
-    "description": "RPG HUD: tracks stats, skills, inventory, quests, party, and world via AI XML tags."
+    "version": "4.1.0",
+    "description": "RPG HUD v4.1: token-saver core (delta-only, tiered, adaptive, off-scene lorebook, heartbeat) + immersion (TIER 4 dynamic cues, NPC return callbacks, stagnation nudges, time-skip, relationship milestones, persona drift, scene transitions) + STATS UPDATE bridge to ff4-vir + slash commands + per-chat rule overlay + rule lorebook export + World Sim tab."
 }
